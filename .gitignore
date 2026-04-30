@@ -1,0 +1,126 @@
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+Thumbs.db
+.DS_Store
+*.log
+
+# Datasets (Large files - keep raw/organized structure but ignore actual data)
+dataset/raw/
+dataset/organized/
+datasets/raw/
+datasets/organized/
+datasets/processed/
+
+# Trained Models
+models/*.pkl
+models/*.h5
+models/*.pth
+models/*.pt
+models/*.joblib
+*.pkl
+*.h5
+*.pth
+*.pt
+*.joblib
+
+# Results and Logs
+results/*.json
+results/*.txt
+logs/*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+.cache/
+
+# pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Cryptography/SSL files
+*.pem
+*.key
+*.crt
+*.cert
+
+# Federated Learning checkpoints
+federated/checkpoints/
+federated/logs/
+
+# Benchmark results
+benchmark/results/
+benchmark/logs/
+
+# Dashboard cache
+dashboard/__pycache__/
+dashboard/*.pyc
+
+# System files
+.pytest_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# Poetry
+poetry.lock
+
+# Pipenv
+Pipfile.lock
+
+# Keep these directories but ignore data files
+!dataset/
+!datasets/
+!models/
+!results/
+!logs/
+!.gitkeep
