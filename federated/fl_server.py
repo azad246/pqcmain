@@ -286,7 +286,7 @@ class SecureWeightedFedAvg(fl.server.strategy.Strategy):
                 "Node1_Rep", "Node1_LocalF1",
                 "Node2_Rep", "Node2_LocalF1",
                 "Node3_Rep", "Node3_LocalF1",
-                "Node1_SigPass", "Node2_SigPass", "Node3_SigPass",
+                "node1_verified", "node2_verified", "node3_verified",
                 "Clients_Aggregated", "Clients_Penalised",
                 "Encryption_Overhead_ms",
                 "Epsilon",
@@ -562,7 +562,7 @@ class SecureWeightedFedAvg(fl.server.strategy.Strategy):
                 round(f1v, 4) if not np.isnan(f1v) else "N/A",
             ]
             if nid in per_node_sig:
-                sig_cols.append("Pass" if per_node_sig[nid] else "Fail")
+                sig_cols.append("True" if per_node_sig[nid] else "False")
             else:
                 sig_cols.append("N/A")
 

@@ -74,6 +74,7 @@ class PQCDashboard(tk.Tk):
         self.create_status_bar()
         
         self.show_view("Dataset")
+        self.refresh_dashboard_data()
 
     def create_sidebar(self):
         self.sidebar_frame = ttk.Frame(self, width=250, padding=15, style="Sidebar.TFrame")
@@ -542,6 +543,25 @@ class PQCDashboard(tk.Tk):
         )
         eps_hint.grid(row=2, column=4, sticky=tk.W, padx=(4, 0), pady=(2, 0))
 
+        # --- Added: Privacy Budget Progress Bar ---
+        pb_frame = ttk.Frame(metrics_frame, padding=(0, 10))
+        pb_frame.grid(row=3, column=0, columnspan=5, sticky=tk.WE)
+        
+        ttk.Label(pb_frame, text="Privacy Budget Usage:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.eps_progress = ttk.Progressbar(pb_frame, orient=tk.HORIZONTAL, length=400, mode='determinate', maximum=1.0)
+        self.eps_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        
+        self.eps_usage_lbl = ttk.Label(pb_frame, text="Privacy budget used: ε=0.00 / 1.0", font=("Segoe UI", 9))
+        self.eps_usage_lbl.pack(side=tk.LEFT)
+
+        # Style for epsilon progress bar colors
+        self.style = ttk.Style()
+        self.style.configure("Green.Horizontal.TProgressbar", foreground='#2ecc71', background='#2ecc71')
+        self.style.configure("Amber.Horizontal.TProgressbar", foreground='#f1c40f', background='#f1c40f')
+        self.style.configure("Red.Horizontal.TProgressbar", foreground='#e74c3c', background='#e74c3c')
+        self.eps_progress.configure(style="Green.Horizontal.TProgressbar")
+
 
         # Visual Frame
         viz_frame = ttk.LabelFrame(self.content_frame, text=" Secure Architecture Visualization ", padding=10)
@@ -792,6 +812,19 @@ class PQCDashboard(tk.Tk):
         ttk.Label(pqc_card, text="Quantum Safe: Yes", font=("Segoe UI", 10)).pack(anchor=tk.W)
         lbl_pqc_safe = tk.Label(pqc_card, text="QUANTUM SAFE", bg="#2ecc71", fg="white", font=("Segoe UI", 12, "bold"), padx=5, pady=2)
         lbl_pqc_safe.pack(anchor=tk.E, pady=(5,0))
+
+        # --- Added: Signature Verification Status ---
+        sig_frame = ttk.LabelFrame(self.content_frame, text=" Signature Verification Status (Dilithium2) ", padding=15)
+        sig_frame.pack(fill=tk.X, pady=(0, 20))
+        
+        self.sig_status_widgets = {}
+        for i in range(1, 4):
+            row = ttk.Frame(sig_frame)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=f"Node {i} Integrity Check:", width=25).pack(side=tk.LEFT)
+            status_icon = ttk.Label(row, text="Waiting...", font=("Segoe UI", 10, "bold"))
+            status_icon.pack(side=tk.LEFT)
+            self.sig_status_widgets[i] = status_icon
 
         action_frame = ttk.Frame(self.content_frame)
         action_frame.pack(fill=tk.X, pady=(0, 20))
