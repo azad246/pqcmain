@@ -1,21 +1,49 @@
 """
 federated/fl_server.py
 ======================
-Secure FL Server with:
-  1. Weighted FedAvg — aggregates client model updates weighted by each
-     client's local F1 score (sent from fl_client.py via fit() metrics).
-  2. Reputation System — each round, computes the median L2 norm of all
-     client weight deltas.  Any client whose update deviates beyond a
-     configurable z-score threshold gets a reputation penalty.
-     Clients whose reputation falls below a floor threshold are excluded
-     from the next round's aggregation.
-  3. PQC encryption / decryption unchanged from original.
+PQC-IoT Sentinel — Secure Federated Learning Server
+
+Strategy: F1×Reputation Weighted Aggregation
+---------------------------------------------
+Each node's aggregation weight is computed as:
+
+    w_i = (local_f1_i × reputation_i) / Σ_j (local_f1_j × reputation_j)
+
+Reputation System (cosine-similarity based)
+-------------------------------------------
+  - Each node starts with reputation_score = 1.0.
+  - After every round the server computes the element-wise median update
+    vector across all verified clients.
+  - Any client whose weight-update cosine similarity to that median falls
+    below COSINE_SIM_THRESHOLD (0.7) receives a penalty of −0.15.
+  - Clients that pass the similarity check are NOT penalised (reputation
+    is held constant; rewards were removed to keep the decay predictable).
+  - Reputation is clamped to [0, 1.0].
+  - Clients whose reputation falls below REPUTATION_FLOOR are EXCLUDED
+    from aggregation that round (but still participate in future rounds).
+
+Logging
+-------
+  results/fl_round_metrics.csv — one row per round:
+    Round | Global_Accuracy | Global_F1 |
+    Node1_Rep | Node1_LocalF1 |
+    Node2_Rep | Node2_LocalF1 |
+    Node3_Rep | Node3_LocalF1 |
+    Clients_Aggregated | Clients_Penalised | Encryption_Overhead_ms
+
+Compatibility
+-------------
+  - Server address unchanged: 0.0.0.0:8080
+  - Reads the same PQC encrypted payloads and Dilithium2 signatures that
+    fl_client.py sends.
+  - Min clients before starting: 3
+  - Total rounds: 10  (config.FL_ROUNDS)
 """
 
 import csv
+import json
 import sys
 import time
-import json
 from pathlib import Path
 
 import numpy as np
@@ -35,189 +63,247 @@ from crypto.encrypt_weights import encrypt_weights, decrypt_weights
 
 
 # ---------------------------------------------------------------------------
-# Reputation constants  (tune as needed)
+# Constants
 # ---------------------------------------------------------------------------
-REPUTATION_INIT          = 1.0   # starting reputation for every client
-REPUTATION_PENALTY       = 0.15  # subtracted each round a client is flagged
-REPUTATION_REWARD        = 0.05  # added each round a client behaves normally
-REPUTATION_FLOOR         = 0.30  # below this → client excluded from aggregation
-DEVIATION_ZSCORE_THRESH  = 2.5   # flag if |norm - median| > threshold * MAD
+MIN_FIT_CLIENTS        = 3       # must have ≥ 3 clients before any round starts
+NUM_ROUNDS             = config.FL_ROUNDS   # 10
+
+REPUTATION_INIT        = 1.0    # every node starts here
+REPUTATION_PENALTY     = 0.15   # subtracted when cosine sim < threshold
+REPUTATION_FLOOR       = 0.30   # below this → excluded from aggregation this round
+COSINE_SIM_THRESHOLD   = 0.70   # minimum cosine similarity to median update
 
 
-# ==============================================================================
-# Weighted FedAvg aggregation helper (pure numpy — no Flower dependency)
-# ==============================================================================
+# ===========================================================================
+# Cosine-similarity utility
+# ===========================================================================
 
-def weighted_fedavg(
-    weight_list: list[list[np.ndarray]],
-    scores: list[float],
-) -> list[np.ndarray]:
-    """
-    Aggregate model weights by a weighted average driven by `scores`.
-
-    Parameters
-    ----------
-    weight_list : list of weight arrays per client (each is a list of ndarrays)
-    scores      : per-client quality score (e.g. local F1); must be >= 0
-
-    Returns
-    -------
-    Aggregated weights as a list of ndarrays.
-    """
-    total = sum(scores)
-    if total == 0:
-        # Fall back to equal weighting if all scores are zero
-        scores = [1.0] * len(scores)
-        total  = float(len(scores))
-
-    aggregated = []
-    for layer_idx in range(len(weight_list[0])):
-        layer_agg = np.zeros_like(weight_list[0][layer_idx], dtype=np.float64)
-        for client_weights, score in zip(weight_list, scores):
-            layer_agg += (score / total) * client_weights[layer_idx].astype(np.float64)
-        aggregated.append(layer_agg)
-    return aggregated
+def _flatten(weight_list: list[np.ndarray]) -> np.ndarray:
+    """Concatenate a list of weight arrays into a single 1-D float64 vector."""
+    return np.concatenate([w.ravel().astype(np.float64) for w in weight_list])
 
 
-# ==============================================================================
-# Reputation tracker
-# ==============================================================================
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Return cosine similarity ∈ [−1, 1] between two flat vectors."""
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a < 1e-12 or norm_b < 1e-12:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+# ===========================================================================
+# Reputation tracker  (cosine-similarity based)
+# ===========================================================================
 
 class ReputationTracker:
     """
-    Tracks a reputation score per client and flags outliers based on the
-    L2 norm of their weight update relative to the median across all clients.
+    Tracks a reputation score in [0, 1] for every client node.
+
+    Each round:
+      1. Flatten each client's weight-update into a 1-D vector.
+      2. Compute the element-wise median update vector.
+      3. Flag any client whose cosine similarity to the median < 0.70.
+      4. Penalise flagged clients by REPUTATION_PENALTY.
     """
 
-    def __init__(self, client_ids: list[int]):
-        self.scores: dict[int, float] = {cid: REPUTATION_INIT for cid in client_ids}
-        self.history: list[dict]      = []   # one entry per round
+    def __init__(self, node_ids: list[int]):
+        self.scores: dict[int, float] = {nid: REPUTATION_INIT for nid in node_ids}
 
     def update(
         self,
         server_round: int,
         client_ids: list[int],
-        weight_updates: list[list[np.ndarray]],
+        weight_deltas: list[list[np.ndarray]],
     ) -> dict[int, bool]:
         """
-        Compute per-client L2 norms, detect outliers, update scores.
-
-        Returns
-        -------
-        flagged : dict mapping client_id → True if flagged this round
+        Compute cosine similarities, update scores, and return a
+        {client_id → penalised?} dict.
         """
-        norms = np.array([
-            float(np.sqrt(sum(np.sum(w ** 2) for w in upd)))
-            for upd in weight_updates
-        ])
+        # ── STEP A: Flatten each client's update ─────────────────────────
+        flat_updates = [_flatten(delta) for delta in weight_deltas]
 
-        median_norm = float(np.median(norms))
-        mad         = float(np.median(np.abs(norms - median_norm))) + 1e-9  # avoid /0
+        # ── STEP B: Element-wise median update vector ────────────────────
+        #   Stack all client vectors into a matrix, take the median across
+        #   clients (axis=0) to get a robust reference direction.
+        stacked = np.stack(flat_updates, axis=0)          # shape: (N_clients, D)
+        median_vec = np.median(stacked, axis=0)           # shape: (D,)
 
-        flagged: dict[int, bool] = {}
-        round_log = {"round": server_round, "clients": {}}
+        # ── STEP C: Cosine similarity of each client to the median ───────
+        penalised: dict[int, bool] = {}
 
-        for cid, norm in zip(client_ids, norms):
-            z_score = abs(norm - median_norm) / mad
-            is_flagged = z_score > DEVIATION_ZSCORE_THRESH
+        print(f"\n  [Reputation] Round {server_round} — "
+              f"cosine-similarity check ({len(client_ids)} clients):")
+        print(f"  {'Node':<8} {'CosSim':<10} {'Threshold':<12} {'Penalised':<10} {'Score'}")
+        print("  " + "-" * 55)
 
-            if is_flagged:
+        for cid, flat_upd in zip(client_ids, flat_updates):
+            cos_sim = cosine_similarity(flat_upd, median_vec)
+            is_penalised = cos_sim < COSINE_SIM_THRESHOLD
+
+            if is_penalised:
+                # ── RULE: decrease reputation by 0.15 ────────────────────
                 self.scores[cid] = max(0.0, self.scores[cid] - REPUTATION_PENALTY)
-                print(f"  [Reputation] ⚠ Client {cid} FLAGGED  "
-                      f"norm={norm:.4f}  z={z_score:.2f}  "
-                      f"rep={self.scores[cid]:.2f}")
-            else:
-                self.scores[cid] = min(1.0, self.scores[cid] + REPUTATION_REWARD)
 
-            flagged[cid] = is_flagged
-            round_log["clients"][cid] = {
-                "norm":      round(norm,           4),
-                "z_score":   round(z_score,        4),
-                "flagged":   is_flagged,
-                "reputation": round(self.scores[cid], 4),
-            }
+            penalised[cid] = is_penalised
 
-        print(f"  [Reputation] Median norm={median_norm:.4f}  MAD={mad:.4f}")
-        self.history.append(round_log)
-        self._save_history()
-        return flagged
+            flag_str = "⚠ YES" if is_penalised else "  no"
+            print(
+                f"  Node {cid:<4} "
+                f"{cos_sim:<10.4f} "
+                f"{COSINE_SIM_THRESHOLD:<12.2f} "
+                f"{flag_str:<10} "
+                f"{self.scores[cid]:.4f}"
+            )
+
+        print()
+        return penalised
 
     def is_trusted(self, client_id: int) -> bool:
         return self.scores.get(client_id, REPUTATION_INIT) >= REPUTATION_FLOOR
 
-    def _save_history(self):
-        out_path = config.RESULTS_PATH / 'reputation_log.json'
-        config.RESULTS_PATH.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(out_path, 'w') as f:
-                json.dump(
-                    {"reputation_floor": REPUTATION_FLOOR, "rounds": self.history},
-                    f, indent=4
-                )
-        except Exception:
-            pass
+
+# ===========================================================================
+# Weighted aggregation
+# ===========================================================================
+
+def f1_reputation_weighted_fedavg(
+    weight_list: list[list[np.ndarray]],
+    client_ids:  list[int],
+    client_f1s:  list[float],
+    reputation:  ReputationTracker,
+) -> list[np.ndarray]:
+    """
+    Aggregate model weights using the formula:
+
+        w_i = (local_f1_i × reputation_i) / Σ_j (local_f1_j × reputation_j)
+
+    Parameters
+    ----------
+    weight_list  : list of per-client weight arrays
+    client_ids   : node IDs matching weight_list order
+    client_f1s   : local F1 scores from fl_client.py fit() metrics
+    reputation   : ReputationTracker holding current scores
+
+    Returns
+    -------
+    Aggregated model weights as a list of ndarrays.
+    """
+    # ── Compute raw weights ─────────────────────────────────────────────
+    raw_weights = [
+        f1 * reputation.scores.get(cid, REPUTATION_INIT)
+        for cid, f1 in zip(client_ids, client_f1s)
+    ]
+    total = sum(raw_weights)
+
+    if total < 1e-12:
+        # Edge-case: all weights zero → fall back to equal weighting
+        print("  [WeightedFedAvg] ⚠ All weights zero — using equal weighting.")
+        raw_weights = [1.0] * len(weight_list)
+        total = float(len(weight_list))
+
+    # ── Normalise ───────────────────────────────────────────────────────
+    normalised = [w / total for w in raw_weights]
+
+    print("  [WeightedFedAvg] Aggregation weights (f1 × rep / Σ):")
+    for cid, f1, rep, nw in zip(
+        client_ids, client_f1s,
+        [reputation.scores.get(c, REPUTATION_INIT) for c in client_ids],
+        normalised,
+    ):
+        print(f"    Node {cid}:  local_f1={f1:.4f}  rep={rep:.4f}  → weight={nw:.4f}")
+
+    # ── Weighted average layer by layer ─────────────────────────────────
+    aggregated: list[np.ndarray] = []
+    n_layers = len(weight_list[0])
+    for layer_idx in range(n_layers):
+        layer_acc = np.zeros_like(weight_list[0][layer_idx], dtype=np.float64)
+        for client_weights, norm_w in zip(weight_list, normalised):
+            layer_acc += norm_w * client_weights[layer_idx].astype(np.float64)
+        aggregated.append(layer_acc)
+
+    return aggregated
 
 
-# ==============================================================================
-# Strategy: Weighted FedAvg + PQC + Reputation
-# ==============================================================================
+# ===========================================================================
+# Strategy: F1×Reputation Weighted FedAvg  +  PQC encryption
+# ===========================================================================
 
 class SecureWeightedFedAvg(fl.server.strategy.Strategy):
     """
-    Custom FL strategy that:
-      - Decrypts incoming weight updates (PQC / Kyber512)
-      - Runs Weighted FedAvg using each client's reported local_f1
-      - Penalises clients whose weight-update L2 norm is an outlier
-      - Re-encrypts the global model per-client before broadcasting
+    Custom Flower strategy implementing:
+      1. Dilithium2 signature verification on incoming updates.
+      2. PQC (Kyber512) decryption of client weight payloads.
+      3. Cosine-similarity reputation system (penalty = −0.15 if sim < 0.70).
+      4. Weighted aggregation: w_i = (f1_i × rep_i) / Σ(f1_j × rep_j).
+      5. PQC re-encryption of the global model before broadcasting.
+      6. Per-round CSV logging to results/fl_round_metrics.csv.
     """
 
     def __init__(
         self,
-        min_fit_clients: int    = config.NUM_NODES,
-        min_evaluate_clients: int = config.NUM_NODES,
-        min_available_clients: int = config.NUM_NODES,
+        min_fit_clients: int       = MIN_FIT_CLIENTS,
+        min_evaluate_clients: int  = MIN_FIT_CLIENTS,
+        min_available_clients: int = MIN_FIT_CLIENTS,
         evaluate_metrics_aggregation_fn=None,
     ):
         self.min_fit_clients           = min_fit_clients
         self.min_evaluate_clients      = min_evaluate_clients
         self.min_available_clients     = min_available_clients
         self.eval_metrics_agg_fn       = evaluate_metrics_aggregation_fn
-        self.metrics_file              = config.RESULTS_PATH / 'fl_round_metrics.csv'
-        self.last_round_overhead       = 0.0
 
+        # Paths
         config.RESULTS_PATH.mkdir(parents=True, exist_ok=True)
+        self.metrics_file = config.RESULTS_PATH / "fl_round_metrics.csv"
 
-        # PQC key generation
-        self.keys_dir = config.BASE_DIR / 'keys'
+        # PQC server keypair
+        self.keys_dir = config.BASE_DIR / "keys"
         self.keys_dir.mkdir(parents=True, exist_ok=True)
-        print(">>> [Server] Generating Server PQC Keypair...")
+        print(">>> [Server] Generating PQC Keypair (Kyber512)...")
         self.server_pub, self.server_sec = pqc_crypto.generate_keypair()
-        with open(self.keys_dir / 'server_pub.pem', 'wb') as f:
-            f.write(self.server_pub)
+        with open(self.keys_dir / "server_pub.pem", "wb") as fh:
+            fh.write(self.server_pub)
 
-        # Reputation tracker — one entry per expected client node
+        # Reputation tracker — one entry per expected node (1, 2, 3)
         self.reputation = ReputationTracker(list(range(1, config.NUM_NODES + 1)))
 
-        # CSV header
-        with open(self.metrics_file, 'w', newline='') as f:
-            csv.writer(f).writerow([
-                'Round', 'Global_Loss', 'Global_Accuracy', 'Global_F1_Score',
-                'Encryption_Overhead_ms', 'Clients_Aggregated', 'Clients_Flagged',
-                'Mean_DP_Epsilon',
+        # Store last global weights for computing deltas
+        self._last_global_weights: list[np.ndarray] | None = None
+
+        # Cache per-round fit metrics for use in aggregate_evaluate
+        self._round_fit_cache: dict = {}
+
+        # Encryption overhead (set in aggregate_fit, read in aggregate_evaluate)
+        self._last_overhead_ms: float = 0.0
+
+        # ── Write CSV header ─────────────────────────────────────────────
+        #   Columns are fixed regardless of NUM_NODES; nodes beyond 3 are
+        #   simply omitted. Columns for nodes 1–3 are always written.
+        with open(self.metrics_file, "w", newline="") as fh:
+            csv.writer(fh).writerow([
+                "Round",
+                "Global_Accuracy", "Global_F1",
+                "Node1_Rep", "Node1_LocalF1",
+                "Node2_Rep", "Node2_LocalF1",
+                "Node3_Rep", "Node3_LocalF1",
+                "Node1_SigPass", "Node2_SigPass", "Node3_SigPass",
+                "Clients_Aggregated", "Clients_Penalised",
+                "Encryption_Overhead_ms",
+                "Epsilon",
             ])
 
-        # Track per-round mean DP epsilon across clients
-        self.last_round_mean_epsilon: float = 0.0
-
-        # Keep last global weights for delta computation
-        self._last_global_weights: list[np.ndarray] | None = None
+        print(f">>> [Server] Metrics CSV: {self.metrics_file}")
+        print(f">>> [Server] Min clients before start: {self.min_available_clients}")
+        print(f">>> [Server] Reputation penalty: −{REPUTATION_PENALTY}  "
+              f"if cosine_sim < {COSINE_SIM_THRESHOLD}")
 
     # ------------------------------------------------------------------
     # Required Strategy interface methods
     # ------------------------------------------------------------------
 
     def initialize_parameters(self, client_manager):
-        return None   # clients initialise their own models
+        """No server-side initialisation — clients initialise their own models."""
+        return None
 
     def configure_fit(self, server_round, parameters, client_manager):
         sample = client_manager.sample(
@@ -236,156 +322,180 @@ class SecureWeightedFedAvg(fl.server.strategy.Strategy):
         return [(client, eval_ins) for client in sample]
 
     # ------------------------------------------------------------------
-    # Core: Weighted FedAvg aggregation with reputation gating
+    # Core: aggregate_fit
+    # Called by Flower after collecting fit() results from all clients.
     # ------------------------------------------------------------------
 
     def aggregate_fit(self, server_round, results, failures):
         if not results:
             return None, {}
 
-        print(f"\n--- Round {server_round} Weighted FedAvg + PQC + Dilithium2 Verification ---")
+        print(f"\n{'='*65}")
+        print(f"  Round {server_round} — Weighted Aggregation (F1 × Reputation)")
+        print(f"{'='*65}")
 
-        # ── STEP 1: Signature verification + Decryption ────────────────
-        start_dec = time.perf_counter()
-        decrypted_weights_per_client: list[list[np.ndarray]] = []
-        client_ids:    list[int]   = []
-        client_f1s:    list[float] = []
-        raw_results_map: list[tuple] = []
-        sig_failures:  list[int]   = []   # client IDs whose signature failed
+        # ── STEP 1: Signature verification + PQC decryption ─────────────
+        t_dec_start = time.perf_counter()
+
+        verified_weights:  list[list[np.ndarray]] = []
+        client_ids:        list[int]               = []
+        client_f1s:        list[float]             = []
+        client_epsilons:   list[float]             = []
+        sig_fail_ids:      list[int]               = []
+        per_node_sig:      dict[int, bool]         = {}
 
         for idx, (client_proxy, fit_res) in enumerate(results):
             cid = idx + 1
+
             ndarrays        = parameters_to_ndarrays(fit_res.parameters)
             encrypted_bytes = ndarrays[0].tobytes()
+            signature       = ndarrays[1].tobytes() if len(ndarrays) > 1 else b""
 
-            # ── Dilithium2 signature verification ────────────────────────
-            sig_hex     = fit_res.metrics.get("signature",       "")
-            pub_hex     = fit_res.metrics.get("signing_pub_key", "")
+            # ── Fetch signing_pk from client properties ──────────────────
+            try:
+                prop_res = client_proxy.get_properties(fl.common.GetPropertiesIns(config={}), timeout=30)
+                pub_hex = prop_res.properties.get("signing_pub_key", "")
+                client_signing_pk = bytes.fromhex(pub_hex) if pub_hex else b""
+            except Exception as e:
+                print(f"  [Verify] ⚠ Node {cid} failed to fetch signing_pk: {e}")
+                client_signing_pk = b""
 
             sig_ok = False
-            if sig_hex and pub_hex:
+            if client_signing_pk:
                 try:
-                    signature   = bytes.fromhex(sig_hex)
-                    signing_pub = bytes.fromhex(pub_hex)
-                    sig_ok      = verify_weights(encrypted_bytes, signature, signing_pub)
+                    sig_ok = verify_weights(encrypted_bytes, signature, client_signing_pk)
+                except ValueError as e:
+                    sig_ok = False
                 except Exception as exc:
                     print(f"  [Verify] ⚠ Node {cid} signature decode error: {exc}")
             else:
-                print(f"  [Verify] ⚠ Node {cid}: signature or public key missing from metrics")
+                print(f"  [Verify] ⚠ Node {cid}: public-key missing")
+
+            per_node_sig[cid] = sig_ok
 
             if sig_ok:
-                print(f"  [Verify] ✓ Node {cid} signature VALID")
+                print(f"  [Verify] ✓ Node {cid} update verified — accepted")
             else:
-                print(f"  [Verify] ✗ Node {cid} signature INVALID — dropping update")
-                sig_failures.append(cid)
-                # Apply an immediate reputation penalty for failed verification
-                self.reputation.scores[cid] = max(
-                    0.0, self.reputation.scores[cid] - 0.25
-                )
-                continue   # skip this client entirely — do not decrypt or aggregate
+                print(f"  [Verify] ✗ Node {cid} signature verification FAILED — update rejected")
+                sig_fail_ids.append(cid)
+                # Immediate reputation hit for a failed signature (set to 0)
+                self.reputation.scores[cid] = 0.0
+                continue
 
-            # ── PQC decryption (only for verified clients) ──────────────
+            # ── PQC decryption (Kyber512) ────────────────────────────────
             dec_weights = decrypt_weights(encrypted_bytes, self.server_sec)
 
-            local_f1   = float(fit_res.metrics.get("local_f1",   0.5))
-            local_loss = float(fit_res.metrics.get("local_loss",  1.0))
-            dp_epsilon = float(fit_res.metrics.get("dp_epsilon",  0.0))
-            dp_delta   = float(fit_res.metrics.get("dp_delta",    1e-5))
+            local_f1   = float(fit_res.metrics.get("local_f1",  0.5))
+            local_loss = float(fit_res.metrics.get("local_loss", 1.0))
+            dp_epsilon = float(fit_res.metrics.get("dp_epsilon", 0.0))
 
-            decrypted_weights_per_client.append(dec_weights)
+            verified_weights.append(dec_weights)
             client_ids.append(cid)
             client_f1s.append(local_f1)
-            raw_results_map.append((client_proxy, fit_res, dec_weights, cid))
+            client_epsilons.append(dp_epsilon)
 
-            print(f"  [Node {cid}] Decrypted  local_f1={local_f1:.4f}  "
-                  f"local_loss={local_loss:.4f}  "
-                  f"DP ε={dp_epsilon:.4f} (δ={dp_delta})  "
-                  f"examples={fit_res.num_examples}")
+            print(
+                f"  [Node {cid}] Decrypted OK  "
+                f"local_f1={local_f1:.4f}  local_loss={local_loss:.4f}  "
+                f"examples={fit_res.num_examples}"
+            )
 
-        dec_time = (time.perf_counter() - start_dec) * 1000
-        verified_count = len(client_ids)
-        print(f">>> [Server] Verified+Decrypted {verified_count}/{len(results)} updates  "
-              f"({len(sig_failures)} failed sig verification)  in {dec_time:.2f} ms")
+        dec_ms = (time.perf_counter() - t_dec_start) * 1000
+        print(f"\n>>> [Server] Verified+Decrypted {len(verified_weights)}/{len(results)} "
+              f"updates  ({len(sig_fail_ids)} failed)  in {dec_ms:.1f} ms")
 
-        if not decrypted_weights_per_client:
+        if not verified_weights:
             print("[ERROR] No clients passed signature verification — aborting round.")
             return None, {}
 
-        # ── STEP 2: Compute weight deltas & run reputation check ───────
+        # ── STEP 2: Compute weight deltas for cosine-similarity check ────
+        #   On round 1 we have no previous global weights, so we use the
+        #   raw weights themselves as the "delta".
         if self._last_global_weights is not None:
             weight_deltas = [
-                [w - g for w, g in zip(client_w, self._last_global_weights)]
-                for client_w in decrypted_weights_per_client
+                [w - g for w, g in zip(cw, self._last_global_weights)]
+                for cw in verified_weights
             ]
         else:
-            weight_deltas = decrypted_weights_per_client   # Round 1: use raw weights
+            weight_deltas = verified_weights  # Round 1 fallback
 
-        print(f"\n  [Reputation] Checking {len(client_ids)} clients (Round {server_round})...")
-        flagged = self.reputation.update(server_round, client_ids, weight_deltas)
+        # ── STEP 3: Reputation update (cosine similarity check) ──────────
+        #   This is the core reputation rule:
+        #     "reputation_score decreases by 0.15 if that node's update
+        #      cosine similarity to the median update is below 0.7"
+        penalised = self.reputation.update(server_round, client_ids, weight_deltas)
+        n_penalised = sum(penalised.values())
 
-        # ── STEP 3: Filter out untrusted clients ───────────────────────
+        # ── STEP 4: Filter out clients below the reputation floor ─────────
         trusted_weights: list[list[np.ndarray]] = []
-        trusted_f1s:     list[float]            = []
-        clients_flagged = 0
+        trusted_ids:     list[int]               = []
+        trusted_f1s:     list[float]             = []
 
-        for cid, weights, f1 in zip(client_ids, decrypted_weights_per_client, client_f1s):
+        for cid, weights, f1 in zip(client_ids, verified_weights, client_f1s):
             if not self.reputation.is_trusted(cid):
-                print(f"  [Reputation] ✗ Client {cid} EXCLUDED "
-                      f"(reputation={self.reputation.scores[cid]:.2f} < floor={REPUTATION_FLOOR})")
-                clients_flagged += 1
+                print(
+                    f"  [Reputation] ✗ Node {cid} EXCLUDED from aggregation "
+                    f"(rep={self.reputation.scores[cid]:.4f} < floor={REPUTATION_FLOOR})"
+                )
                 continue
-            if flagged.get(cid, False):
-                clients_flagged += 1   # flagged but still above floor — count but include
             trusted_weights.append(weights)
+            trusted_ids.append(cid)
             trusted_f1s.append(f1)
 
         if not trusted_weights:
-            print("[WARNING] All clients excluded by reputation system — using all clients as fallback.")
-            trusted_weights = decrypted_weights_per_client
+            print("[WARNING] All clients below reputation floor — including all as fallback.")
+            trusted_weights = verified_weights
+            trusted_ids     = client_ids
             trusted_f1s     = client_f1s
 
-        # ── STEP 4: Weighted FedAvg ────────────────────────────────────
-        print(f"\n  [WeightedFedAvg] Aggregating {len(trusted_weights)} trusted clients")
-        for cid, f1 in zip(client_ids, trusted_f1s):
-            print(f"    Node {cid}: weight={f1:.4f}  (local_f1 as aggregation weight)")
-
-        global_weights = weighted_fedavg(trusted_weights, trusted_f1s)
+        # ── STEP 5: Weighted aggregation — w_i = (f1_i × rep_i) / Σ ─────
+        #   This is the central aggregation step that replaces plain FedAvg.
+        global_weights = f1_reputation_weighted_fedavg(
+            trusted_weights, trusted_ids, trusted_f1s, self.reputation
+        )
         self._last_global_weights = global_weights
 
-        # ── STEP 5: Re-encrypt for each client (broadcast) ─────────────
-        start_enc = time.perf_counter()
-        bundled_encrypted = []
+        # ── STEP 6: Re-encrypt global model per client before broadcast ──
+        t_enc_start = time.perf_counter()
+        bundled_encrypted: list[np.ndarray] = []
 
         for node_id in range(1, config.NUM_NODES + 1):
-            client_pub_path = self.keys_dir / f'client_{node_id}_pub.pem'
-            while not client_pub_path.exists():
+            client_pub_path = self.keys_dir / f"client_{node_id}_pub.pem"
+            # Wait for client key file (written by fl_client.py on startup)
+            waited = 0
+            while not client_pub_path.exists() and waited < 60:
                 time.sleep(1)
-            with open(client_pub_path, 'rb') as f:
-                client_pub = f.read()
+                waited += 1
+            with open(client_pub_path, "rb") as fh:
+                client_pub = fh.read()
             enc_bytes = encrypt_weights(global_weights, client_pub)
             bundled_encrypted.append(np.frombuffer(enc_bytes, dtype=np.uint8))
 
-        enc_time = (time.perf_counter() - start_enc) * 1000
-        print(f">>> [Server] Re-encrypted for {config.NUM_NODES} clients in {enc_time:.2f} ms")
+        enc_ms = (time.perf_counter() - t_enc_start) * 1000
+        self._last_overhead_ms = dec_ms + enc_ms
+        print(f">>> [Server] Re-encrypted for {config.NUM_NODES} clients in {enc_ms:.1f} ms")
 
-        self.last_round_overhead = dec_time + enc_time
-
-        # Compute mean DP epsilon across all clients this round
-        epsilons = [float(r.metrics.get("dp_epsilon", 0.0)) for _, r in results]
-        self.last_round_mean_epsilon = float(np.mean(epsilons)) if epsilons else 0.0
-        if epsilons:
-            print(f"  [DP] Mean ε this round: {self.last_round_mean_epsilon:.4f}  "
-                  f"(min={min(epsilons):.4f}  max={max(epsilons):.4f})")
+        # ── STEP 7: Cache per-node metrics for CSV logging ───────────────
+        #   aggregate_evaluate() will write the CSV row; we cache fit data
+        #   here so reputation/F1 is available at that point.
+        per_node_f1 = {cid: f1 for cid, f1 in zip(client_ids, client_f1s)}
+        round_epsilon = max(client_epsilons) if client_epsilons else 0.0
+        self._round_fit_cache[server_round] = {
+            "per_node_f1":  per_node_f1,
+            "per_node_sig": per_node_sig,
+            "n_aggregated": len(trusted_weights),
+            "n_penalised":  n_penalised,
+            "epsilon":      round_epsilon,
+        }
 
         agg_metrics = {
             "clients_aggregated": len(trusted_weights),
-            "clients_flagged":    clients_flagged,
-            "mean_dp_epsilon":    self.last_round_mean_epsilon,
+            "clients_penalised":  n_penalised,
         }
         return ndarrays_to_parameters(bundled_encrypted), agg_metrics
 
     # ------------------------------------------------------------------
-    # Evaluation aggregation (unchanged logic, extra CSV column)
+    # aggregate_evaluate — called after clients return evaluate() results
     # ------------------------------------------------------------------
 
     def aggregate_evaluate(self, server_round, results, failures):
@@ -396,8 +506,10 @@ class SecureWeightedFedAvg(fl.server.strategy.Strategy):
         if total_examples == 0:
             return None, {}
 
+        # Weighted loss
         loss_agg = sum(r.loss * r.num_examples for _, r in results) / total_examples
 
+        # Aggregate accuracy and F1 using the custom fn, or simple weighted mean
         if self.eval_metrics_agg_fn:
             agg_metrics = self.eval_metrics_agg_fn(
                 [(r.num_examples, r.metrics) for _, r in results]
@@ -405,85 +517,117 @@ class SecureWeightedFedAvg(fl.server.strategy.Strategy):
         else:
             agg_metrics = {}
 
-        accuracy = agg_metrics.get("accuracy", 0.0)
-        f1       = agg_metrics.get("f1",       0.0)
-        overhead = self.last_round_overhead
+        global_accuracy = float(agg_metrics.get("accuracy", 0.0))
+        global_f1       = float(agg_metrics.get("f1",       0.0))
 
-        clients_agg     = len(results)
-        clients_flagged = sum(
-            1 for cid, score in self.reputation.scores.items()
-            if score < REPUTATION_INIT
-        )
+        # Pull fit-phase cache for this round
+        fit_cache    = self._round_fit_cache.get(server_round, {})
+        per_node_f1  = fit_cache.get("per_node_f1",  {})
+        per_node_sig = fit_cache.get("per_node_sig", {})
+        n_agg        = fit_cache.get("n_aggregated",  len(results))
+        n_penalised  = fit_cache.get("n_penalised",   0)
+        round_eps    = fit_cache.get("epsilon",       0.0)
+        overhead_ms  = self._last_overhead_ms
 
-        print(f"\n{'*'*55}")
-        print(f"--- Round {server_round} Complete ---")
-        mean_epsilon = getattr(self, 'last_round_mean_epsilon', 0.0)
+        # ── Print round summary ──────────────────────────────────────────
+        print(f"\n{'*'*65}")
+        print(f"  Round {server_round} Complete")
+        print(f"  Global Loss:          {loss_agg:.4f}")
+        print(f"  Global Accuracy:      {global_accuracy:.4f}")
+        print(f"  Global F1-Score:      {global_f1:.4f}")
+        print(f"  Clients Aggregated:   {n_agg}")
+        print(f"  Clients Penalised:    {n_penalised}")
+        print(f"  Encryption Overhead:  {overhead_ms:.1f} ms")
 
-        print(f"Global Loss:            {loss_agg:.4f}")
-        print(f"Global Accuracy:        {accuracy:.4f}")
-        print(f"Global F1-Score:        {f1:.4f}")
-        print(f"Encryption Overhead:    {overhead:.2f} ms")
-        print(f"Clients aggregated:     {clients_agg}")
-        print(f"Clients with rep < 1.0: {clients_flagged}")
-        print(f"Mean DP ε (this round): {mean_epsilon:.4f}")
-        print(f"Reputation scores:      {self.reputation.scores}")
-        print(f"{'*'*55}\n")
+        # ── Print per-node reputation scores (rule 4) ────────────────────
+        print("\n  ┌─ Per-Node Reputation Scores (after this round) ─────────┐")
+        for nid in sorted(self.reputation.scores):
+            rep     = self.reputation.scores[nid]
+            f1_val  = per_node_f1.get(nid, float("nan"))
+            status  = "⚠ PENALISED" if nid in per_node_f1 and rep < REPUTATION_INIT else "OK"
+            below   = " [BELOW FLOOR]" if rep < REPUTATION_FLOOR else ""
+            print(f"  │  Node {nid}: rep={rep:.4f}  local_f1={f1_val:.4f}  {status}{below}")
+        print("  └──────────────────────────────────────────────────────────┘")
+        print(f"{'*'*65}\n")
 
-        with open(self.metrics_file, 'a', newline='') as f:
-            csv.writer(f).writerow([
-                server_round, loss_agg, accuracy, f1,
-                overhead, clients_agg, clients_flagged,
-                round(mean_epsilon, 6),
+        # ── Write CSV row ────────────────────────────────────────────────
+        #   Fixed 3-node columns; missing nodes get 'N/A'
+        node_cols: list = []
+        sig_cols: list = []
+        for nid in [1, 2, 3]:
+            rep = self.reputation.scores.get(nid, float("nan"))
+            f1v = per_node_f1.get(nid, float("nan"))
+            node_cols += [
+                round(rep, 4) if not np.isnan(rep) else "N/A",
+                round(f1v, 4) if not np.isnan(f1v) else "N/A",
+            ]
+            if nid in per_node_sig:
+                sig_cols.append("Pass" if per_node_sig[nid] else "Fail")
+            else:
+                sig_cols.append("N/A")
+
+        with open(self.metrics_file, "a", newline="") as fh:
+            csv.writer(fh).writerow([
+                server_round,
+                round(global_accuracy, 4),
+                round(global_f1, 4),
+                *node_cols,                     # Node1_Rep, Node1_F1, Node2_Rep, ...
+                *sig_cols,                      # Node1_SigPass, ...
+                n_agg,
+                n_penalised,
+                round(overhead_ms, 2),
+                round(round_eps, 6),
             ])
 
         return loss_agg, agg_metrics
 
     # ------------------------------------------------------------------
-    # evaluate() — server-side model evaluation (optional, can be None)
+    # evaluate — optional server-side evaluation (not used)
     # ------------------------------------------------------------------
 
     def evaluate(self, server_round, parameters):
         return None
 
 
-# ==============================================================================
-# Global metrics aggregation function (for evaluate phase)
-# ==============================================================================
+# ===========================================================================
+# Global metrics aggregation helper (passed to strategy)
+# ===========================================================================
 
 def evaluate_metrics_aggregation_fn(metrics):
+    """Weighted average of accuracy and F1 across all clients."""
     total_examples = sum(n for n, _ in metrics)
     if total_examples == 0:
         return {"accuracy": 0.0, "f1": 0.0}
-    accuracies = [n * m["accuracy"] for n, m in metrics]
-    f1s        = [n * m["f1"]       for n, m in metrics]
-    return {
-        "accuracy": sum(accuracies) / total_examples,
-        "f1":       sum(f1s)        / total_examples,
-    }
+    accuracy = sum(n * m["accuracy"] for n, m in metrics) / total_examples
+    f1       = sum(n * m["f1"]       for n, m in metrics) / total_examples
+    return {"accuracy": accuracy, "f1": f1}
 
 
-# ==============================================================================
+# ===========================================================================
 # Server entry point
-# ==============================================================================
+# ===========================================================================
 
 def start_server():
     print("=" * 65)
-    print("Starting Secure PQC Flower FL Server")
-    print("Strategy: SecureWeightedFedAvg (Weighted FedAvg + Reputation + PQC KEM)")
-    print(f"Expected Clients: {config.NUM_NODES}")
-    print(f"Reputation Floor: {REPUTATION_FLOOR}  |  Deviation Threshold (z): {DEVIATION_ZSCORE_THRESH}")
+    print("  PQC-IoT Sentinel — Federated Learning Server")
+    print("  Strategy : F1 × Reputation Weighted Aggregation")
+    print(f"  Port     : 0.0.0.0:8080")
+    print(f"  Rounds   : {NUM_ROUNDS}")
+    print(f"  Min clients before start: {MIN_FIT_CLIENTS}")
+    print(f"  Reputation penalty : −{REPUTATION_PENALTY} if cosine_sim < {COSINE_SIM_THRESHOLD}")
+    print(f"  Reputation floor   : {REPUTATION_FLOOR} (excluded from aggregation)")
     print("=" * 65)
 
     strategy = SecureWeightedFedAvg(
-        min_fit_clients=config.NUM_NODES,
-        min_evaluate_clients=config.NUM_NODES,
-        min_available_clients=config.NUM_NODES,
+        min_fit_clients=MIN_FIT_CLIENTS,
+        min_evaluate_clients=MIN_FIT_CLIENTS,
+        min_available_clients=MIN_FIT_CLIENTS,
         evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
     )
 
     fl.server.start_server(
         server_address="0.0.0.0:8080",
-        config=fl.server.ServerConfig(num_rounds=config.FL_ROUNDS),
+        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
     )
 

@@ -225,6 +225,93 @@ def save_report_csv(report_dict: dict):
 
 
 # ==============================================================================
+# PER-NODE HARDEST ATTACK TABLE  (spec §3 & §4)
+# ==============================================================================
+
+def _print_hardest_attacks(per_attack: dict) -> list[str]:
+    """
+    Load per_attack_metrics.json, print a formatted table of every attack type
+    per node sorted by F1 ascending (hardest first), then call out the top-2
+    hardest attacks per node.
+
+    Parameters
+    ----------
+    per_attack : dict
+        Structure: {nodeX: {attack_type: {precision, recall, f1, support}}}
+
+    Returns
+    -------
+    List of text lines for embedding in the paper summary.
+    """
+    if not per_attack:
+        msg = "[WARNING] per_attack_metrics.json not found or empty. " \
+              "Run ensemble_model.py first."
+        print(msg)
+        return [msg]
+
+    output_lines: list[str] = []
+    col_w = 26   # attack-type column width
+
+    for node_key, attack_dict in sorted(per_attack.items()):
+        if not attack_dict:
+            continue
+
+        # Sort all attack types by F1 ascending (hardest first)
+        sorted_attacks = sorted(
+            attack_dict.items(),
+            key=lambda kv: kv[1].get('f1', 1.0),
+        )
+
+        header = (
+            f"\n  {'Attack Type':<{col_w}} | "
+            f"{'Precision':>10} | {'Recall':>8} | {'F1':>8} | {'Support':>8}"
+        )
+        divider = "  " + "-" * (col_w + 47)
+
+        print(f"\n{'='*70}")
+        print(f"  [{node_key.upper()}] Per-Attack-Type Detection Difficulty (sorted by F1 ↑)")
+        print(f"{'='*70}")
+        print(header)
+        print(divider)
+
+        output_lines.append(f"\n[{node_key.upper()}] Attack Detection Difficulty:")
+
+        for attack, m in sorted_attacks:
+            f1_val  = m.get('f1',        0.0)
+            prec    = m.get('precision', 0.0)
+            rec     = m.get('recall',    0.0)
+            sup     = m.get('support',   0)
+
+            # Highlight the hardest attacks (F1 < 0.5) with a marker
+            flag = " ◄ HARD" if f1_val < 0.50 else ""
+            row  = (
+                f"  {attack:<{col_w}} | "
+                f"{prec:>10.4f} | {rec:>8.4f} | {f1_val:>8.4f} | {sup:>8}{flag}"
+            )
+            print(row)
+            output_lines.append(row.strip())
+
+        print(divider)
+
+        # ── Top-2 hardest attack types per node (spec §4) ────────────────
+        # Filter out 'benign' so we only rank attack classes
+        attack_only = [
+            (atk, m) for atk, m in sorted_attacks
+            if atk != 'benign'
+        ]
+
+        for rank, (atk, m) in enumerate(attack_only[:2], start=1):
+            f1_val = m.get('f1', 0.0)
+            stmt   = f"  Hardest to detect: {atk} with F1={f1_val:.4f}"
+            print(stmt)
+            output_lines.append(stmt.strip())
+
+        print()
+
+    return output_lines
+
+
+# ==============================================================================
 # MAIN EVALUATION
 # ==============================================================================
 
@@ -236,12 +323,13 @@ def run_evaluation():
     # ------------------------------------------------------------------
     # 1. Load aggregate results
     # ------------------------------------------------------------------
-    rf_metrics      = load_json('local_rf_metrics.json')
-    ae_metrics      = load_json('local_ae_metrics.json')
+    rf_metrics       = load_json('local_rf_metrics.json')
+    ae_metrics       = load_json('local_ae_metrics.json')
     ensemble_metrics = load_json('ensemble_metrics.json')
-    cross_data      = load_json('cross_dataset_results.json')
-    crypto_bench    = load_json('crypto_benchmark.json')
-    benchmark_csv   = load_csv('benchmark_comparison.csv')
+    per_attack       = load_json('per_attack_metrics.json')   # NEW
+    cross_data       = load_json('cross_dataset_results.json')
+    crypto_bench     = load_json('crypto_benchmark.json')
+    benchmark_csv    = load_csv('benchmark_comparison.csv')
 
     # ------------------------------------------------------------------
     # 2. NEW — per-attack-type classification report
@@ -251,6 +339,11 @@ def run_evaluation():
     print(report_str)
     save_report_json(report_dict)
     save_report_csv(report_dict)
+
+    # ------------------------------------------------------------------
+    # 2b. NEW — per-node hardest-to-detect attack table (spec §3 & §4)
+    # ------------------------------------------------------------------
+    hardest_findings = _print_hardest_attacks(per_attack)
 
     # ------------------------------------------------------------------
     # 3. Extract benchmark / crypto / cross-dataset metrics (unchanged)
@@ -296,6 +389,12 @@ def run_evaluation():
     # Embed the per-attack report in the text summary as well
     output_text.append("\n--- Per-Attack-Type Classification Report ---")
     output_text.append(report_str)
+
+    # Embed hardest-attack findings (spec §3)
+    if hardest_findings:
+        output_text.append("\n--- Hardest-to-Detect Attack Types (Key Finding) ---")
+        for line in hardest_findings:
+            output_text.append(line)
 
     output_text.append("\n--- Configuration Benchmark Comparison ---")
     if benchmark_csv:

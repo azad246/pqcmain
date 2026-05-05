@@ -2,10 +2,14 @@ import os
 import base64
 import hashlib
 import warnings
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric import rsa, padding, ec
+from cryptography.hazmat.primitives.asymmetric.utils import (
+    decode_dss_signature, encode_dss_signature,
+)
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 from cryptography.fernet import Fernet
+from cryptography.exceptions import InvalidSignature
 
 PQC_AVAILABLE = False
 try:
@@ -216,8 +220,13 @@ class SignatureManager:
                 sec = sig.export_secret_key()
             return pub, sec
         else:
-            # RSA-PSS fallback — reuse the serialisation from PQCManager
-            sk  = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            # ── CLASSICAL FALLBACK (NOT PQC) — ECDSA P-256 ───────────────
+            # NOTE: This is a classical ECDSA signature, NOT post-quantum.
+            # It is used only when liboqs/Dilithium2 is unavailable.
+            # ECDSA is vulnerable to quantum attacks via Shor's algorithm.
+            print("[SignatureManager] ⚠ CLASSICAL FALLBACK: ECDSA P-256 "
+                  "(NOT PQC — vulnerable to quantum attack)")
+            sk  = ec.generate_private_key(ec.SECP256R1())
             pub = sk.public_key().public_bytes(
                 serialization.Encoding.PEM,
                 serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -240,15 +249,9 @@ class SignatureManager:
             with oqs.Signature(self.SIG_ALGORITHM, secret_key) as sig:
                 return sig.sign(digest)
         else:
+            # ECDSA P-256 fallback (classical — NOT PQC)
             sk = serialization.load_pem_private_key(secret_key, password=None)
-            return sk.sign(
-                digest,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH,
-                ),
-                hashes.Prehashed(hashes.SHA256()),
-            )
+            return sk.sign(digest, ec.ECDSA(hashes.Prehashed(hashes.SHA256())))
 
     # ------------------------------------------------------------------
     def verify(self, data_bytes: bytes, signature: bytes, public_key: bytes) -> bool:
@@ -259,19 +262,14 @@ class SignatureManager:
         digest = hashlib.sha256(data_bytes).digest()
         try:
             if self.use_pqc:
+                result = False
                 with oqs.Signature(self.SIG_ALGORITHM) as sig:
-                    return sig.verify(digest, signature, public_key)
+                    result = sig.verify(digest, signature, public_key)
+                return result
             else:
+                # ECDSA P-256 fallback (classical — NOT PQC)
                 pk = serialization.load_pem_public_key(public_key)
-                pk.verify(
-                    signature,
-                    digest,
-                    padding.PSS(
-                        mgf=padding.MGF1(hashes.SHA256()),
-                        salt_length=padding.PSS.MAX_LENGTH,
-                    ),
-                    hashes.Prehashed(hashes.SHA256()),
-                )
+                pk.verify(signature, digest, ec.ECDSA(hashes.Prehashed(hashes.SHA256())))
                 return True
         except Exception:
             return False
@@ -331,20 +329,74 @@ def sign_weights(weights_bytes: bytes, private_key: bytes) -> bytes:
 
 def verify_weights(weights_bytes: bytes, signature: bytes, public_key: bytes) -> bool:
     """
-    Verify a Dilithium2 signature over a weight payload.
+    Verify a Dilithium2 (or ECDSA fallback) signature over a weight payload.
 
     Parameters
     ----------
     weights_bytes : the exact same bytes that were signed on the client
     signature     : signature bytes returned by sign_weights()
-    public_key    : Dilithium2 public key of the signing client
+    public_key    : Dilithium2 (or ECDSA) public key of the signing client
 
     Returns
     -------
-    True  — payload is authentic and unmodified
-    False — signature invalid, payload tampered, or wrong key
+    True — payload is authentic and unmodified.
+
+    Raises
+    ------
+    ValueError
+        If the signature is invalid or the payload has been tampered with.
+        Message: "Tampered weights rejected — signature invalid"
     """
-    return _signature_manager.verify(weights_bytes, signature, public_key)
+    valid = _signature_manager.verify(weights_bytes, signature, public_key)
+    if not valid:
+        raise ValueError("Tampered weights rejected — signature invalid")
+    return True
+
+
+def dual_pqc_info() -> None:
+    """
+    Print a summary of both PQC primitives in use:
+      - Kyber512 (KEM) — confidentiality
+      - Dilithium2 (Signature) — integrity
+    Includes key sizes, signature size, and claimed NIST security levels.
+    """
+    print("\n" + "=" * 60)
+    print("  PQC-IoT Sentinel — Dual PQC Primitive Summary")
+    print("=" * 60)
+
+    # ── Kyber512 (KEM) details ───────────────────────────────────────
+    print("\n  [KEM] CRYSTALS-Kyber512  (Key Encapsulation Mechanism)")
+    if PQC_AVAILABLE and _default_manager.use_pqc:
+        print(f"    Algorithm      : {_default_manager.kem_name}")
+        print(f"    NIST Sec Level : {_default_manager.security_level}")
+        print(f"    Public Key     : {_default_manager.kem_length_public_key} bytes")
+        print(f"    Secret Key     : {_default_manager.kem_length_secret_key} bytes")
+        print(f"    Ciphertext     : {_default_manager.kem_length_ciphertext} bytes")
+    else:
+        print("    Status         : ⚠ RSA-2048 fallback (NOT PQC)")
+        print("    Public Key     : ~294 bytes (PEM)")
+        print("    Secret Key     : ~1704 bytes (PEM)")
+        print("    NIST Sec Level : Pre-quantum (vulnerable to Shor's algorithm)")
+
+    # ── Dilithium2 (Signature) details ───────────────────────────────
+    print("\n  [SIG] CRYSTALS-Dilithium2  (Digital Signature)")
+    if _signature_manager.use_pqc:
+        print(f"    Algorithm      : {_signature_manager.sig_name}")
+        print(f"    NIST Sec Level : 2  (128-bit post-quantum security)")
+        print(f"    Public Key     : {_signature_manager.pub_key_length} bytes")
+        print(f"    Secret Key     : {_signature_manager.sec_key_length} bytes")
+        print(f"    Signature      : {_signature_manager.sig_length} bytes")
+    else:
+        print("    Status         : ⚠ ECDSA P-256 fallback (NOT PQC — classical)")
+        print("    Public Key     : ~91 bytes (PEM)")
+        print("    Secret Key     : ~121 bytes (PEM)")
+        print("    Signature      : ~71 bytes (DER)")
+        print("    NIST Sec Level : Pre-quantum (vulnerable to Shor's algorithm)")
+
+    print("\n  " + "-" * 56)
+    print("  Confidentiality: Kyber512 | Integrity: Dilithium2")
+    print("  " + "-" * 56)
+    print("=" * 60 + "\n")
 
 
 # =========================================================================
@@ -352,34 +404,63 @@ def verify_weights(weights_bytes: bytes, signature: bytes, public_key: bytes) ->
 # =========================================================================
 
 if __name__ == '__main__':
+
+    # ── Dual PQC info ──────────────────────────────────────────────────
+    dual_pqc_info()
     get_algorithm_info()
 
     # ── KEM self-test ──────────────────────────────────────────────────
-    print("\nRunning Hybrid-Encryption Self-Test...")
-    pub, sec = generate_keypair()
-    message   = b"PQC-IoT Sentinel: Secure FL Model Weights Transmission Payload!"
-    print(f"Original: {message}")
-    ciphertext = encrypt_data(message, pub)
-    print(f"Encrypted bundle: {len(ciphertext)} bytes")
-    decrypted = decrypt_data(ciphertext, sec)
-    print(f"Decrypted: {decrypted}")
-    assert message == decrypted, "[ERROR] Encryption/Decryption mismatch!"
-    print("KEM self-test PASSED.")
+    print("\n[Test 1] Hybrid-Encryption Roundtrip...")
+    kem_pub, kem_sec = generate_keypair()
+    message    = b"PQC-IoT Sentinel: Secure FL Model Weights Payload!"
+    ciphertext = encrypt_data(message, kem_pub)
+    decrypted  = decrypt_data(ciphertext, kem_sec)
+    assert message == decrypted, "[FAIL] KEM roundtrip mismatch!"
+    print(f"  Encrypted: {len(ciphertext)} bytes  |  Decrypted matches original")
+    print("  [PASS] KEM roundtrip")
 
     # ── Signature self-test ────────────────────────────────────────────
-    print("\nRunning Dilithium2 Signature Self-Test...")
+    print("\n[Test 2] Dilithium2 Signature Roundtrip...")
     sig_pub, sig_sec = generate_signing_keypair()
-    payload  = b"FL weight bytes example payload"
-    sig      = sign_weights(payload, sig_sec)
-    print(f"Signature length: {len(sig)} bytes")
+    payload = b"FL weight bytes example"
+    sig     = sign_weights(payload, sig_sec)
+    print(f"  Signature length: {len(sig)} bytes")
 
-    ok = verify_weights(payload, sig, sig_pub)
-    assert ok,  "[ERROR] Valid signature rejected!"
-    print("Valid signature accepted — PASSED.")
+    result = verify_weights(payload, sig, sig_pub)
+    assert result, "[FAIL] Valid signature rejected!"
+    print("  [PASS] Valid signature accepted")
 
-    tampered = payload + b"X"
-    nok = verify_weights(tampered, sig, sig_pub)
-    assert not nok, "[ERROR] Tampered payload accepted!"
-    print("Tampered payload rejected  — PASSED.")
-    print("\nAll self-tests PASSED.")
+    try:
+        verify_weights(payload + b"X", sig, sig_pub)
+        assert False, "[FAIL] Tampered payload accepted!"
+    except ValueError as e:
+        print(f"  [PASS] Tampered payload raised ValueError: {e}")
+
+    # ── COMBINED: Encrypt + Sign → Verify + Decrypt ───────────────────
+    print("\n[Test 3] Combined Encrypt+Sign → Verify+Decrypt Roundtrip...")
+    weights_payload = b"Simulated FL model weight bytes " * 10
+
+    # Client side: encrypt then sign the ciphertext
+    encrypted_bundle  = encrypt_data(weights_payload, kem_pub)
+    bundle_signature  = sign_weights(encrypted_bundle, sig_sec)
+    print(f"  Encrypted bundle : {len(encrypted_bundle)} bytes")
+    print(f"  Signature        : {len(bundle_signature)} bytes")
+
+    # Server side: verify signature then decrypt
+    sig_ok = verify_weights(encrypted_bundle, bundle_signature, sig_pub)
+    assert sig_ok, "[FAIL] Combined test: signature rejected!"
+    recovered = decrypt_data(encrypted_bundle, kem_sec)
+    assert recovered == weights_payload, "[FAIL] Combined test: decryption mismatch!"
+    print("  [PASS] Signature verified — decryption successful — payload matches")
+
+    # Tamper the bundle and confirm rejection
+    try:
+        verify_weights(encrypted_bundle + b"tamper", bundle_signature, sig_pub)
+        assert False, "[FAIL] Tampered bundle accepted!"
+    except ValueError as e:
+        print(f"  [PASS] Tampered bundle raised ValueError: {e}")
+
+    print("\n" + "=" * 60)
+    print("  All self-tests PASSED.")
+    print("=" * 60)
 

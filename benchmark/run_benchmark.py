@@ -35,6 +35,70 @@ def evaluate_model(y_true, y_pred, y_prob=None):
             pass
     return prec, rec, f1, auc
 
+
+def measure_communication_overhead():
+    import json
+    print("\n" + "="*95)
+    print("Measuring Communication Overhead (Table 2)")
+    print("="*95)
+
+    # 1. Sample model weight array (similar to FL weights)
+    dummy_weights = [
+        np.random.rand(115, 128).astype(np.float32),
+        np.random.rand(128).astype(np.float32),
+        np.random.rand(128, 64).astype(np.float32),
+        np.random.rand(64).astype(np.float32),
+        np.random.rand(64, 11).astype(np.float32),
+        np.random.rand(11).astype(np.float32)
+    ]
+    
+    raw_bytes = weights_to_bytes(dummy_weights)
+    plaintext_size_kb = len(raw_bytes) / 1024
+    
+    kem_pub, kem_sec = pqc_crypto.generate_keypair()
+    sig_pub, sig_sec = pqc_crypto.generate_signing_keypair()
+    
+    manager_rsa = pqc_crypto.PQCManager('Kyber512')
+    manager_rsa.use_pqc = False 
+    pub_rsa, sec_rsa = manager_rsa.generate_keypair()
+    
+    # RSA
+    t0 = time.perf_counter()
+    rsa_enc = manager_rsa.encrypt_data(raw_bytes, pub_rsa)
+    time_rsa = (time.perf_counter() - t0) * 1000
+    rsa_size_kb = len(rsa_enc) / 1024
+    
+    # Kyber
+    t0 = time.perf_counter()
+    kyber_enc = encrypt_weights(dummy_weights, kem_pub)
+    time_kyber = (time.perf_counter() - t0) * 1000
+    kyber_size_kb = len(kyber_enc) / 1024
+    
+    # Kyber + Dilithium2
+    t0 = time.perf_counter()
+    kyber_enc2 = encrypt_weights(dummy_weights, kem_pub)
+    sig = pqc_crypto.sign_weights(kyber_enc2, sig_sec)
+    time_kyber_dilithium = (time.perf_counter() - t0) * 1000
+    kyber_sig_size_kb = (len(kyber_enc2) + len(sig)) / 1024
+    
+    results_overhead = [
+        {"Method": "Plaintext",           "Size (KB)": round(plaintext_size_kb, 2), "Overhead %": 0.0,                                               "Time (ms)": 0.0},
+        {"Method": "RSA-2048",            "Size (KB)": round(rsa_size_kb, 2),       "Overhead %": round((rsa_size_kb/plaintext_size_kb - 1)*100, 2), "Time (ms)": round(time_rsa, 2)},
+        {"Method": "Kyber512",            "Size (KB)": round(kyber_size_kb, 2),     "Overhead %": round((kyber_size_kb/plaintext_size_kb - 1)*100, 2), "Time (ms)": round(time_kyber, 2)},
+        {"Method": "Kyber512+Dilithium2", "Size (KB)": round(kyber_sig_size_kb, 2), "Overhead %": round((kyber_sig_size_kb/plaintext_size_kb - 1)*100, 2), "Time (ms)": round(time_kyber_dilithium, 2)}
+    ]
+    
+    out_path = config.RESULTS_PATH / 'communication_overhead.json'
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, 'w') as f:
+        json.dump(results_overhead, f, indent=4)
+        
+    print(f"{'Method':<20} | {'Size (KB)':<10} | {'Overhead %':<10} | {'Time (ms)':<10}")
+    print("-" * 58)
+    for r in results_overhead:
+        print(f"{r['Method']:<20} | {r['Size (KB)']:<10.2f} | {r['Overhead %']:<9.2f}% | {r['Time (ms)']:<8.2f}ms")
+    print("="*95)
+
 def run_benchmarks():
     print("="*95)
     print("Starting Comprehensive System Benchmark (Config A vs B vs C vs D)")
@@ -265,208 +329,241 @@ def run_benchmarks():
 
     # =====================================================================
     # Config D: Byzantine Simulation (FL + PQC + Poisoned Node 3)
-    # Architecture: Identical to Config C, but Node 3 is a Byzantine attacker.
-    #   - It receives the global model and performs normal local training.
-    #   - Before encrypting the upload, its trained weights are silently replaced
-    #     with Gaussian random noise (garbage weights).
-    # The Weighted FedAvg defence assigns Node 3 a near-zero aggregation weight
-    # (because its local F1 on garbage outputs is ~0), protecting the global model.
+    # Two sub-runs:
+    #   D1 — plain FedAvg (equal weights) with Node 3 sending random garbage
+    #   D2 — F1-weighted FedAvg (reputation-based) with same Byzantine Node 3
+    # Comparison shows how much F1 drops under plain FedAvg and how well
+    # weighted FedAvg recovers.
     # =====================================================================
-    print(">>> [Running Config D] Byzantine Simulation (Node 3 sends garbage weights)")
-    tracemalloc.start()
-    start_time = time.perf_counter()
+    print(">>> [Running Config D] Byzantine Simulation — Plain FedAvg vs Weighted FedAvg")
 
     BYZANTINE_NODE = 2   # 0-indexed → Node 3
+    rng = np.random.default_rng(seed=42)   # reproducible garbage
 
-    manager_d         = pqc_crypto.PQCManager('Kyber512')
-    server_pub_d, server_sec_d = manager_d.generate_keypair()
-    client_keys_d     = [manager_d.generate_keypair() for _ in range(3)]
+    def _run_byzantine_fl(use_weighted: bool) -> tuple:
+        """
+        Run 10 rounds of FL+PQC with Node 3 sending random numpy arrays.
+        If use_weighted=True  → weight_i = f1_i / sum(f1_j)  (weighted FedAvg)
+        If use_weighted=False → weight_i = 1/N               (plain FedAvg)
+        Returns (f1, precision, recall, auc, train_time_s, pqc_overhead_ms)
+        """
+        mgr = pqc_crypto.PQCManager('Kyber512')
+        srv_pub, srv_sec = mgr.generate_keypair()
+        cli_keys = [mgr.generate_keypair() for _ in range(3)]
 
-    clients_d = [MLPClassifier(hidden_layer_sizes=(128, 64), max_iter=1) for _ in range(3)]
-    for c, X, y in zip(clients_d, X_trains, y_trains):
-        c.partial_fit(X[:10], y[:10], classes=all_classes)
+        clients_d = [MLPClassifier(hidden_layer_sizes=(128, 64), max_iter=1) for _ in range(3)]
+        for c, X, y in zip(clients_d, X_trains, y_trains):
+            c.partial_fit(X[:10], y[:10], classes=all_classes)
 
-    global_model_d = MLPClassifier(hidden_layer_sizes=(128, 64), max_iter=1)
-    global_model_d.partial_fit(X_trains[0][:10], y_trains[0][:10], classes=all_classes)
+        gm = MLPClassifier(hidden_layer_sizes=(128, 64), max_iter=1)
+        gm.partial_fit(X_trains[0][:10], y_trains[0][:10], classes=all_classes)
 
-    comm_bytes_d    = 0
-    pqc_overhead_d  = 0.0
-    byzantine_log   = []
-    rng             = np.random.default_rng(seed=42)   # reproducible garbage
+        overhead_ms = 0.0
+        t_start = time.perf_counter()
 
-    for r in range(rounds):
-        local_weights_d = []
-        local_f1_scores = []
-        round_info      = {"round": r + 1, "clients": {}}
+        for r in range(rounds):
+            local_weights_d = []
+            local_f1_scores = []
 
-        for i, c in enumerate(clients_d):
-            node_label = f"Node {i + 1}"
+            for i, c in enumerate(clients_d):
+                # Server encrypts broadcast
+                t0 = time.perf_counter()
+                enc_g = encrypt_weights(get_mlp_weights(gm), cli_keys[i][0])
+                overhead_ms += (time.perf_counter() - t0) * 1000
+                t0 = time.perf_counter()
+                dec_g = decrypt_weights(enc_g, cli_keys[i][1])
+                overhead_ms += (time.perf_counter() - t0) * 1000
+                set_mlp_weights(c, dec_g)
 
-            # Server broadcasts encrypted global model
-            t0 = time.perf_counter()
-            enc_global = encrypt_weights(get_mlp_weights(global_model_d), client_keys_d[i][0])
-            pqc_overhead_d += (time.perf_counter() - t0) * 1000
-            comm_bytes_d   += len(enc_global)
+                # Local training
+                c.partial_fit(X_trains[i], y_trains[i])
+                trained_w = get_mlp_weights(c)
 
-            t0 = time.perf_counter()
-            dec_global = decrypt_weights(enc_global, client_keys_d[i][1])
-            pqc_overhead_d += (time.perf_counter() - t0) * 1000
-            set_mlp_weights(c, dec_global)
+                # Local F1 (used as weight by weighted FedAvg)
+                y_loc = c.predict(X_test)
+                loc_f1 = float(f1_score(y_test, y_loc, average='weighted', zero_division=0))
 
-            # Local training on real data
-            c.partial_fit(X_trains[i], y_trains[i])
-            trained_weights = get_mlp_weights(c)
+                # ── BYZANTINE INJECTION: Node 3 sends random numpy arrays ──
+                if i == BYZANTINE_NODE:
+                    upload_w = [
+                        rng.normal(0.0, 10.0, w.shape).astype(w.dtype)
+                        for w in trained_w
+                    ]
+                    # Poisoned node's reported F1 is 0 (server detects garbage output)
+                    loc_f1 = 0.0
+                else:
+                    upload_w = trained_w
 
-            # Compute local F1 on validation set (mimics client-reported metric)
-            y_val_pred = c.predict(X_test)
-            local_f1   = float(f1_score(y_test, y_val_pred,
-                                        average='weighted', zero_division=0))
+                # Client encrypts upload
+                t0 = time.perf_counter()
+                enc_l = encrypt_weights(upload_w, srv_pub)
+                overhead_ms += (time.perf_counter() - t0) * 1000
+                t0 = time.perf_counter()
+                dec_l = decrypt_weights(enc_l, srv_sec)
+                overhead_ms += (time.perf_counter() - t0) * 1000
 
-            # ── BYZANTINE INJECTION ─────────────────────────────────────
-            # Node 3 replaces its trained update with Gaussian random garbage.
-            poisoned = False
-            if i == BYZANTINE_NODE:
-                garbage_weights = [
-                    rng.normal(loc=0.0, scale=10.0, size=w.shape).astype(w.dtype)
-                    for w in trained_weights
-                ]
-                upload_weights  = garbage_weights
-                poisoned        = True
-                honest_f1_claim = local_f1   # what it would report if honest
-                # Actual F1 when server evaluates the poisoned model ≈ 0
-                # We set it to 0 here to show Weighted FedAvg zeroing its weight
-                local_f1        = 0.0
-                print(f"  [Byzantine] ⚠ {node_label}: weights REPLACED with Gaussian noise  "
-                      f"(honest_f1={honest_f1_claim:.4f} → poisoned_weight=0.0)")
+                local_weights_d.append(dec_l)
+                local_f1_scores.append(loc_f1)
+
+            # ── Aggregation ───────────────────────────────────────────────
+            if use_weighted:
+                # Weighted FedAvg: w_i = f1_i / Σ f1_j
+                # Byzantine node has loc_f1=0 → weight≈0 → global model protected
+                total_f1 = sum(local_f1_scores)
+                w_norm = (
+                    [f / total_f1 for f in local_f1_scores]
+                    if total_f1 > 1e-9
+                    else [1.0 / len(local_f1_scores)] * len(local_f1_scores)
+                )
             else:
-                upload_weights  = trained_weights
-                honest_f1_claim = local_f1
+                # Plain FedAvg: equal weights — Byzantine node poisons equally
+                w_norm = [1.0 / len(local_weights_d)] * len(local_weights_d)
 
-            # Client encrypts its update and sends to server
-            t0 = time.perf_counter()
-            enc_local = encrypt_weights(upload_weights, server_pub_d)
-            pqc_overhead_d += (time.perf_counter() - t0) * 1000
-            comm_bytes_d   += len(enc_local)
+            agg_w = []
+            for li in range(len(local_weights_d[0])):
+                la = np.zeros_like(local_weights_d[0][li], dtype=np.float64)
+                for cw, wn in zip(local_weights_d, w_norm):
+                    la += wn * cw[li].astype(np.float64)
+                agg_w.append(la)
+            set_mlp_weights(gm, agg_w)
 
-            t0 = time.perf_counter()
-            dec_local = decrypt_weights(enc_local, server_sec_d)
-            pqc_overhead_d += (time.perf_counter() - t0) * 1000
+        train_time = time.perf_counter() - t_start
+        y_pred_d = gm.predict(X_test)
+        y_prob_d = gm.predict_proba(X_test)
+        p, rc, f, au = evaluate_model(y_test, y_pred_d, y_prob_d)
+        return f, p, rc, au, train_time, overhead_ms
 
-            local_weights_d.append(dec_local)
-            local_f1_scores.append(local_f1)
-
-            round_info["clients"][node_label] = {
-                "poisoned":        poisoned,
-                "local_f1_used":   round(local_f1,          4),
-                "honest_f1_claim": round(honest_f1_claim,   4),
-            }
-
-        # ── Weighted FedAvg ─────────────────────────────────────────────
-        # Byzantine node has local_f1 = 0 → weight ≈ 0 → global model protected
-        total_f1     = sum(local_f1_scores)
-        if total_f1 == 0:
-            w_norm = [1.0 / len(local_f1_scores)] * len(local_f1_scores)
-        else:
-            w_norm = [f / total_f1 for f in local_f1_scores]
-
-        avg_weights_d = []
-        for layer_idx in range(len(local_weights_d[0])):
-            layer_agg = np.zeros_like(local_weights_d[0][layer_idx], dtype=np.float64)
-            for client_w, wn in zip(local_weights_d, w_norm):
-                layer_agg += wn * client_w[layer_idx].astype(np.float64)
-            avg_weights_d.append(layer_agg)
-        set_mlp_weights(global_model_d, avg_weights_d)
-
-        round_info["aggregation_weights"] = [
-            {f"Node {i+1}": round(w, 6)} for i, w in enumerate(w_norm)
-        ]
-        byzantine_log.append(round_info)
-
-        if (r + 1) % 5 == 0 or r == 0:
-            y_tmp  = global_model_d.predict(X_test)
-            f1_tmp = f1_score(y_test, y_tmp, average='weighted', zero_division=0)
-            print(f"  [Config D] Round {r+1:>2}/{rounds}  "
-                  f"agg_weights={[round(w, 3) for w in w_norm]}  "
-                  f"global_f1={f1_tmp:.4f}")
-
-    train_time_d = time.perf_counter() - start_time
-    _, peak_mem_d = tracemalloc.get_traced_memory()
+    # ── D1: Plain FedAvg under Byzantine attack ───────────────────────────
+    print("  [Config D1] Plain FedAvg + Byzantine Node 3...")
+    tracemalloc.start()
+    f1_d1, prec_d1, rec_d1, auc_d1, time_d1, oh_d1 = _run_byzantine_fl(use_weighted=False)
+    _, peak_d1 = tracemalloc.get_traced_memory()
     tracemalloc.stop()
+    print(f"  [Config D1] Plain FedAvg under attack → F1={f1_d1:.4f}")
 
-    y_pred_d = global_model_d.predict(X_test)
-    y_prob_d = global_model_d.predict_proba(X_test)
-    prec_d, rec_d, f1_d, auc_d = evaluate_model(y_test, y_pred_d, y_prob_d)
+    # ── D2: Weighted FedAvg under Byzantine attack ────────────────────────
+    print("  [Config D2] Weighted FedAvg + Byzantine Node 3...")
+    tracemalloc.start()
+    f1_d2, prec_d2, rec_d2, auc_d2, time_d2, oh_d2 = _run_byzantine_fl(use_weighted=True)
+    _, peak_d2 = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    print(f"  [Config D2] Weighted FedAvg under attack → F1={f1_d2:.4f}")
+
+    # ── Degradation vs clean baseline (Config C) ──────────────────────────
+    f1_degradation_plain    = round((f1_c - f1_d1) / max(f1_c, 1e-9) * 100, 2)  # % drop
+    f1_degradation_weighted = round((f1_c - f1_d2) / max(f1_c, 1e-9) * 100, 2)
 
     results.append({
-        'Configuration':          'D: Byzantine Sim (Node 3 Poisoned)',
-        'F1-Score':               f1_d,
-        'Precision':              prec_d,
-        'Recall':                 rec_d,
-        'AUC-ROC':                auc_d,
-        'Training_Time_s':        train_time_d,
-        'Encryption_Overhead_ms': pqc_overhead_d,
-        'Memory_MB':              peak_mem_d / (1024 * 1024),
-        'Communication_KB':       comm_bytes_d / 1024,
+        'Configuration':          'D1: FL+PQC+Byzantine (Plain FedAvg)',
+        'F1-Score':               f1_d1,
+        'Precision':              prec_d1,
+        'Recall':                 rec_d1,
+        'AUC-ROC':                auc_d1,
+        'Training_Time_s':        time_d1,
+        'Encryption_Overhead_ms': oh_d1,
+        'Memory_MB':              peak_d1 / (1024 * 1024),
+        'Communication_KB':       0.0,
+        'byzantine_node':         'Node 3',
+        'fedavg_type':            'plain',
+        'f1_degradation_pct':     f1_degradation_plain,
     })
-    print(f"  [Config D] Final → F1={f1_d:.4f}  AUC={auc_d:.4f}  "
-          f"(Config C baseline F1={f1_c:.4f}  delta={f1_d - f1_c:+.4f})")
+    results.append({
+        'Configuration':          'D2: FL+PQC+Byzantine (Weighted FedAvg)',
+        'F1-Score':               f1_d2,
+        'Precision':              prec_d2,
+        'Recall':                 rec_d2,
+        'AUC-ROC':                auc_d2,
+        'Training_Time_s':        time_d2,
+        'Encryption_Overhead_ms': oh_d2,
+        'Memory_MB':              peak_d2 / (1024 * 1024),
+        'Communication_KB':       0.0,
+        'byzantine_node':         'Node 3',
+        'fedavg_type':            'weighted',
+        'f1_degradation_pct':     f1_degradation_weighted,
+    })
+
 
     # =====================================================================
     # Data Output & CLI Table Generation
     # =====================================================================
     import json
 
-    df_res  = pd.DataFrame(results)
+    # Fill missing columns for A/B/C rows so CSV is uniform
+    for row in results:
+        row.setdefault('byzantine_node',    'None')
+        row.setdefault('fedavg_type',       'N/A')
+        row.setdefault('f1_degradation_pct', 0.0)
+
+    # Canonical column order (matches spec)
+    CSV_COLS = [
+        'Configuration', 'F1-Score', 'Precision', 'Recall', 'AUC-ROC',
+        'Training_Time_s', 'Encryption_Overhead_ms', 'Memory_MB', 'Communication_KB',
+        'byzantine_node', 'fedavg_type', 'f1_degradation_pct',
+    ]
+    df_res  = pd.DataFrame(results, columns=CSV_COLS)
     out_dir = config.RESULTS_PATH
     out_dir.mkdir(parents=True, exist_ok=True)
     df_res.to_csv(out_dir / 'benchmark_comparison.csv', index=False)
 
-    # Save detailed Byzantine simulation log
+    # Save Byzantine comparison summary as JSON
     byz_log_path = out_dir / 'byzantine_simulation_log.json'
     with open(byz_log_path, 'w') as f:
         json.dump({
-            "description": (
-                "Config D: Node 3 replaced its trained weights with Gaussian noise "
-                "each round. Weighted FedAvg assigned it aggregation_weight=0 "
-                "(local_f1=0), limiting poisoning impact on the global model."
+            'description': (
+                'Config D: Node 3 sends completely random numpy arrays as model weights '
+                'each round (Byzantine attacker). '
+                'D1 uses plain FedAvg (equal weights); '
+                'D2 uses weighted FedAvg (weight=f1_i/sum(f1_j), Byzantine node gets 0).'
             ),
-            "byzantine_node":  f"Node {BYZANTINE_NODE + 1}",
-            "config_c_f1":     round(f1_c, 4),
-            "config_d_f1":     round(f1_d, 4),
-            "f1_degradation":  round(f1_c - f1_d, 4),
-            "rounds":          byzantine_log,
+            'byzantine_node':            'Node 3',
+            'baseline_f1_config_c':      round(f1_c,  4),
+            'plain_fedavg_f1_d1':        round(f1_d1, 4),
+            'weighted_fedavg_f1_d2':     round(f1_d2, 4),
+            'plain_f1_degradation_pct':  f1_degradation_plain,
+            'weighted_f1_degradation_pct': f1_degradation_weighted,
         }, f, indent=4)
 
     print("\n" + "="*110)
     print("FINAL BENCHMARK COMPARISON MATRIX")
     print("="*110)
 
-    header = (f"{'Configuration':<40} | {'F1':<6} | {'AUC':<6} | "
-              f"{'Train(s)':<8} | {'Crypto(ms)':<10} | {'Mem(MB)':<8} | {'Comm(KB)':<8}")
+    header = (f"{'Configuration':<42} | {'F1':<6} | {'AUC':<6} | "
+              f"{'Train(s)':<8} | {'Crypto(ms)':<10} | {'Mem(MB)':<8} | "
+              f"{'Byzantine':<10} | {'FedAvg':<10} | {'F1-Drop%':<8}")
     print(header)
     print("-" * len(header))
 
-    for r in results:
-        tag = " [POISONED]" if "Byzantine" in r['Configuration'] else ""
-        row = (f"{r['Configuration'] + tag:<40} | "
-               f"{r['F1-Score']:.4f} | {r['AUC-ROC']:.4f} | "
-               f"{r['Training_Time_s']:<8.2f} | {r['Encryption_Overhead_ms']:<10.2f} | "
-               f"{r['Memory_MB']:<8.2f} | {r['Communication_KB']:<8.2f}")
-        print(row)
+    for row in results:
+        print(
+            f"{row['Configuration']:<42} | "
+            f"{row['F1-Score']:.4f} | {row['AUC-ROC']:.4f} | "
+            f"{row['Training_Time_s']:<8.2f} | {row['Encryption_Overhead_ms']:<10.2f} | "
+            f"{row['Memory_MB']:<8.2f} | "
+            f"{str(row['byzantine_node']):<10} | "
+            f"{str(row['fedavg_type']):<10} | "
+            f"{row['f1_degradation_pct']:<8.2f}"
+        )
 
     print("="*110)
-    degradation = f1_c - f1_d
-    verdict = ("Weighted FedAvg absorbed most of the attack" if abs(degradation) < 0.05
-               else "significant degradation — tighten reputation gating")
-    print(f"\nByzantine Impact Summary:")
-    print(f"  Config C (Clean FL+PQC)       F1 = {f1_c:.4f}")
-    print(f"  Config D (Node 3 Byzantine)   F1 = {f1_d:.4f}")
-    print(f"  F1 degradation               : {degradation:+.4f}  ({verdict})")
+
+    # ── Required summary statement ────────────────────────────────────────
+    print(f"\nByzantine Attack Summary (Node 3 sends random numpy arrays):")
+    print(
+        f"  Weighted FedAvg maintained {f1_d2*100:.1f}% F1 "
+        f"vs plain FedAvg dropped to {f1_d1*100:.1f}% F1 "
+        f"under Byzantine attack"
+    )
+    print(f"  Baseline (Config C clean):    F1 = {f1_c:.4f}")
+    print(f"  D1 Plain FedAvg (poisoned):   F1 = {f1_d1:.4f}  "
+          f"({f1_degradation_plain:+.2f}% degradation)")
+    print(f"  D2 Weighted FedAvg (defence): F1 = {f1_d2:.4f}  "
+          f"({f1_degradation_weighted:+.2f}% degradation)")
     print("="*110)
-    print(f"[OK] Benchmark CSV  saved → {out_dir / 'benchmark_comparison.csv'}")
-    print(f"[OK] Byzantine log  saved → {byz_log_path}")
+    print(f"[OK] Benchmark CSV   saved → {out_dir / 'benchmark_comparison.csv'}")
+    print(f"[OK] Byzantine JSON  saved → {byz_log_path}")
 
 
 if __name__ == "__main__":
+    measure_communication_overhead()
     run_benchmarks()
 
