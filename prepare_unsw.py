@@ -13,7 +13,7 @@ def prepare_unsw():
     print("Preparing UNSW-NB15 Dataset for Cross-Dataset Validation")
     print("="*60)
 
-    unsw_path = config.DATA_PATHS['test'] / 'testing_set.csv'
+    unsw_path = config.DATA_PATHS['test'] / 'UNSW_NB15_testing-set.csv'
     
     if not unsw_path.exists():
         print(f"[ERROR] UNSW dataset not found at {unsw_path}")

@@ -7,3 +7,5 @@ matplotlib
 seaborn
 liboqs-python
 joblib
+torch
+opacus>=0.15

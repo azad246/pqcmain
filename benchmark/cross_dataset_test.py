@@ -47,6 +47,8 @@ def load_or_train_global_model():
     X_trains, y_trains = [], []
     for i in range(1, config.NUM_NODES + 1):
         df = pd.read_csv(nodes_dir / f'node{i}_train.csv', low_memory=False)
+        if len(df) > 10000:
+            df = df.sample(n=10000, random_state=42)
         X_trains.append(df.drop(columns=['label']).values)
         y_trains.append(df['label'].values)
         
@@ -76,6 +78,8 @@ def run_cross_dataset_test():
         
     print("Loading completely unseen UNSW-NB15 testbed...")
     df_unsw = pd.read_csv(unsw_path, low_memory=False)
+    if len(df_unsw) > 10000:
+        df_unsw = df_unsw.sample(n=10000, random_state=42)
     X_unsw = df_unsw.drop(columns=['label']).values
     y_unsw = df_unsw['label'].values # Already binary encoded (0=normal, 1=attack) by prepare_unsw.py
     

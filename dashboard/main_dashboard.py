@@ -34,10 +34,36 @@ class PQCDashboard(tk.Tk):
         self.title("PQC-IoT Sentinel — Control Dashboard")
         self.geometry("1200x800")
         self.minsize(900, 600)
+        self.configure(bg="#1e1e2e")
         
         style = ttk.Style(self)
         if 'clam' in style.theme_names():
             style.theme_use('clam')
+            
+        # Modern Dark Theme Palette
+        self.bg_main = "#1e1e2e"
+        self.bg_alt = "#181825"
+        self.fg_main = "#cdd6f4"
+        self.fg_sub = "#a6adc8"
+        self.accent = "#89b4fa"
+        
+        style.configure(".", background=self.bg_main, foreground=self.fg_main, font=("Segoe UI", 10))
+        style.configure("TFrame", background=self.bg_main)
+        style.configure("TLabel", background=self.bg_main, foreground=self.fg_main)
+        style.configure("Header.TLabel", font=("Segoe UI", 24, "bold"), foreground=self.accent)
+        style.configure("Sub.TLabel", font=("Segoe UI", 12), foreground=self.fg_sub)
+        style.configure("TLabelframe", background=self.bg_main, foreground=self.accent, bordercolor=self.fg_sub)
+        style.configure("TLabelframe.Label", background=self.bg_main, foreground=self.accent, font=("Segoe UI", 11, "bold"))
+        
+        style.configure("TButton", background=self.bg_alt, foreground=self.fg_main, font=("Segoe UI", 10, "bold"), padding=6)
+        style.map("TButton", background=[("active", self.accent)], foreground=[("active", self.bg_main)])
+        
+        style.configure("Sidebar.TFrame", background=self.bg_alt)
+        style.configure("Sidebar.TLabel", background=self.bg_alt, foreground=self.fg_main)
+        
+        style.configure("Treeview", background=self.bg_main, foreground=self.fg_main, fieldbackground=self.bg_main, bordercolor=self.bg_alt)
+        style.configure("Treeview.Heading", background=self.bg_alt, foreground=self.accent, font=("Segoe UI", 10, "bold"))
+        style.map("Treeview", background=[('selected', self.accent)], foreground=[('selected', self.bg_main)])
             
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1) 
@@ -50,13 +76,13 @@ class PQCDashboard(tk.Tk):
         self.show_view("Dataset")
 
     def create_sidebar(self):
-        self.sidebar_frame = ttk.Frame(self, width=250, relief=tk.RAISED, padding=15)
+        self.sidebar_frame = ttk.Frame(self, width=250, padding=15, style="Sidebar.TFrame")
         self.sidebar_frame.grid(row=0, column=0, sticky="nswe")
         self.sidebar_frame.grid_propagate(False)
 
-        title_lbl = ttk.Label(self.sidebar_frame, text="PQC-IoT Sentinel", font=("Segoe UI", 16, "bold"))
+        title_lbl = ttk.Label(self.sidebar_frame, text="PQC-IoT Sentinel", font=("Segoe UI", 16, "bold"), style="Sidebar.TLabel")
         title_lbl.pack(pady=(10, 5))
-        subtitle_lbl = ttk.Label(self.sidebar_frame, text="Control Interface", font=("Segoe UI", 10), foreground="gray")
+        subtitle_lbl = ttk.Label(self.sidebar_frame, text="Control Interface", font=("Segoe UI", 10), foreground=self.fg_sub, style="Sidebar.TLabel")
         subtitle_lbl.pack(pady=(0, 30))
 
         nav_buttons = [
@@ -115,7 +141,7 @@ class PQCDashboard(tk.Tk):
         for widget in self.content_frame.winfo_children():
             widget.destroy()
             
-        title = ttk.Label(self.content_frame, text=view_name, font=("Segoe UI", 24, "bold"))
+        title = ttk.Label(self.content_frame, text=view_name, style="Header.TLabel")
         title.pack(anchor=tk.W, pady=(0, 10))
         
         descriptions = {
@@ -130,21 +156,27 @@ class PQCDashboard(tk.Tk):
         }
         
         desc_text = descriptions.get(view_name, "Loading module parameters...")
-        desc = ttk.Label(self.content_frame, text=desc_text, font=("Segoe UI", 12), wraplength=800, foreground="#444")
+        desc = ttk.Label(self.content_frame, text=desc_text, style="Sub.TLabel", wraplength=800)
         desc.pack(anchor=tk.W, pady=(0, 20))
         
         if view_name == "Dataset":
             self.build_dataset_view()
+        elif view_name == "Preprocessing":
+            self.build_preprocessing_view()
         elif view_name == "Train Models":
             self.build_train_models_view()
         elif view_name == "Federation":
             self.build_federation_view()
         elif view_name == "Crypto":
             self.build_crypto_view()
-        elif view_name == "Results":
-            self.build_results_view()
         elif view_name == "Simulation":
             self.build_simulation_view()
+        elif view_name == "Benchmark":
+            self.build_benchmark_view()
+        elif view_name == "Results":
+            self.build_results_view()
+        elif view_name == "Paper Figures":
+            self.build_figures_view()
         else:
             self.build_placeholder_view(view_name)
 
@@ -258,7 +290,7 @@ class PQCDashboard(tk.Tk):
         script_path = config.BASE_DIR / 'data_loader.py'
         try:
             process = subprocess.Popen(
-                [sys.executable, str(script_path)],
+                [sys.executable, '-u', str(script_path)],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True
             )
             for line in iter(process.stdout.readline, ''):
@@ -398,7 +430,7 @@ class PQCDashboard(tk.Tk):
             script_path = config.BASE_DIR / script
             try:
                 process = subprocess.Popen(
-                    [sys.executable, str(script_path)],
+                    [sys.executable, '-u', str(script_path)],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -457,15 +489,59 @@ class PQCDashboard(tk.Tk):
         )
         self.start_fed_btn.pack(side=tk.LEFT)
         
-        # Metrics Frame
-        metrics_frame = ttk.LabelFrame(self.content_frame, text=" Live Federation Metrics ", padding=10)
+        # ── Live Federation Metrics ─────────────────────────────────────
+        metrics_frame = ttk.LabelFrame(
+            self.content_frame, text=" Live Federation Metrics ", padding=12
+        )
         metrics_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        self.round_label = ttk.Label(metrics_frame, text="Round 0 of 10", font=("Segoe UI", 12, "bold"))
-        self.round_label.pack(side=tk.LEFT, padx=(0, 20))
-        
-        self.accuracy_label = ttk.Label(metrics_frame, text="Global Accuracy: N/A", font=("Segoe UI", 12))
-        self.accuracy_label.pack(side=tk.LEFT)
+
+        # Row 0 — Round counter (full width)
+        self.round_label = ttk.Label(
+            metrics_frame, text="Round — / —",
+            font=("Segoe UI", 12, "bold"), foreground=self.accent
+        )
+        self.round_label.grid(row=0, column=0, columnspan=5, sticky=tk.W, pady=(0, 8))
+
+        # Row 1 — five metric tiles
+        tile_cfg = [
+            ("Global Accuracy", "N/A",  "#89b4fa", "accuracy_label"),
+            ("Global F1-Score", "N/A",  "#a6e3a1", "f1_label"),
+            ("Global Loss",     "N/A",  "#f38ba8", "loss_label"),
+            ("DP ε (budget)",   "N/A",  "#cba6f7", "epsilon_label"),
+            ("Reputation ⚠",   "N/A",  "#fab387", "flagged_label"),
+        ]
+        for col, (title, init_val, colour, attr) in enumerate(tile_cfg):
+            tile = ttk.Frame(metrics_frame, padding=6)
+            tile.grid(row=1, column=col, padx=(0, 12), sticky=tk.W)
+
+            ttk.Label(
+                tile, text=title,
+                font=("Segoe UI", 9), foreground=self.fg_sub
+            ).pack(anchor=tk.W)
+
+            val_lbl = tk.Label(
+                tile, text=init_val,
+                font=("Segoe UI", 14, "bold"),
+                fg=colour, bg=self.bg_main, padx=4
+            )
+            val_lbl.pack(anchor=tk.W)
+            setattr(self, attr, val_lbl)
+
+        # Epsilon badge — colour-coded privacy risk indicator
+        self.epsilon_badge = tk.Label(
+            metrics_frame,
+            text="● STRONG", font=("Segoe UI", 8, "bold"),
+            fg="white", bg="#2ecc71", padx=6, pady=2, relief=tk.FLAT
+        )
+        self.epsilon_badge.grid(row=2, column=3, sticky=tk.W, pady=(2, 0))
+
+        eps_hint = ttk.Label(
+            metrics_frame,
+            text="ε<1 strong  |  1≤ε<10 moderate  |  ε≥10 weak",
+            font=("Segoe UI", 8), foreground=self.fg_sub
+        )
+        eps_hint.grid(row=2, column=4, sticky=tk.W, padx=(4, 0), pady=(2, 0))
+
 
         # Visual Frame
         viz_frame = ttk.LabelFrame(self.content_frame, text=" Secure Architecture Visualization ", padding=10)
@@ -478,6 +554,16 @@ class PQCDashboard(tk.Tk):
         
         self.lines = []
         self.is_federating = False
+        
+        self.fed_log_area = tk.Text(self.content_frame, height=10, width=80, state=tk.DISABLED, bg=self.bg_main, fg=self.fg_main, font=("Consolas", 10), relief=tk.FLAT)
+        self.fed_log_area.pack(fill=tk.BOTH, expand=True, pady=(15, 0))
+
+    def log_fed_msg(self, message):
+        if hasattr(self, 'fed_log_area') and self.fed_log_area.winfo_exists():
+            self.fed_log_area.config(state=tk.NORMAL)
+            self.fed_log_area.insert(tk.END, message + "\n")
+            self.fed_log_area.see(tk.END)
+            self.fed_log_area.config(state=tk.DISABLED)
         
     def _draw_canvas(self, event=None):
         if not hasattr(self, 'canvas') or not self.canvas.winfo_exists():
@@ -525,8 +611,20 @@ class PQCDashboard(tk.Tk):
     def start_federation(self):
         self.start_fed_btn.state(['disabled'])
         self.is_federating = True
-        self.round_label.config(text="Round 0 of 10")
-        self.accuracy_label.config(text="Global Accuracy: N/A")
+
+        # Reset all metric tiles
+        self.round_label.config(text="Round — / —")
+        for attr, placeholder in [
+            ('accuracy_label', 'N/A'),
+            ('f1_label',       'N/A'),
+            ('loss_label',     'N/A'),
+            ('epsilon_label',  'N/A'),
+            ('flagged_label',  'N/A'),
+        ]:
+            if hasattr(self, attr):
+                getattr(self, attr).config(text=placeholder)
+        if hasattr(self, 'epsilon_badge'):
+            self.epsilon_badge.config(text="● STARTING", bg="#6c757d")
         
         metrics_file = config.RESULTS_PATH / "fl_round_metrics.csv"
         if metrics_file.exists():
@@ -546,18 +644,29 @@ class PQCDashboard(tk.Tk):
         env['PQC_ENABLED'] = '1' if self.pqc_enabled_var.get() else '0'
         
         try:
+            self.after(0, self.fed_log_area.config, {'state': tk.NORMAL})
+            self.after(0, self.fed_log_area.delete, '1.0', tk.END)
+            self.after(0, self.fed_log_area.config, {'state': tk.DISABLED})
+            self.after(0, self.log_fed_msg, ">>> Executing: python federated/launch_federation.py")
+            
             process = subprocess.Popen(
-                [sys.executable, str(script_path)],
+                [sys.executable, '-u', str(script_path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                bufsize=1,
+                universal_newlines=True,
                 env=env
             )
             for line in iter(process.stdout.readline, ''):
-                pass 
+                self.after(0, self.log_fed_msg, line.strip())
             process.wait()
+            if process.returncode != 0:
+                self.after(0, self.log_fed_msg, f"\n[ERROR] Process crashed with exit code {process.returncode}")
+            else:
+                self.after(0, self.log_fed_msg, "\n[SUCCESS] Federation complete.")
         except Exception as e:
-            pass
+            self.after(0, self.log_fed_msg, f"[FATAL EXCEPTION] {str(e)}")
             
         self.is_federating = False
         self.after(0, lambda: self.start_fed_btn.state(['!disabled']))
@@ -577,32 +686,89 @@ class PQCDashboard(tk.Tk):
         self.after(2000, self.poll_federation_metrics)
         
     def _read_metrics_file(self):
+        """Parse fl_round_metrics.csv and update all live metric tiles."""
         metrics_file = config.RESULTS_PATH / "fl_round_metrics.csv"
-        if metrics_file.exists():
-            try:
-                with open(metrics_file, 'r') as f:
-                    lines = [line.strip() for line in f.readlines() if line.strip()]
-                    if len(lines) > 1:
-                        last_line = lines[-1].split(',')
-                        header = lines[0].split(',')
-                        
-                        acc_idx = -1
-                        for i, h in enumerate(header):
-                            if 'acc' in h.lower():
-                                acc_idx = i
-                                break
-                                
-                        rnd = last_line[0]
-                        acc = last_line[acc_idx] if acc_idx != -1 else (last_line[1] if len(last_line) > 1 else "N/A")
-                        
-                        self.round_label.config(text=f"Round {rnd} of 10")
+        if not metrics_file.exists():
+            return
+        try:
+            with open(metrics_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                rows   = [r for r in reader if any(v.strip() for v in r.values())]
+            if not rows:
+                return
+
+            last = rows[-1]
+            # Normalise keys: strip whitespace, lower-case
+            last = {k.strip().lower(): v.strip() for k, v in last.items()}
+
+            # ── Round counter ──────────────────────────────────────────────────
+            rnd_raw = next((v for k, v in last.items() if 'round' in k), None)
+            total   = getattr(config, 'FL_ROUNDS', 10)
+            if rnd_raw:
+                self.round_label.config(text=f"Round {rnd_raw} / {total}")
+
+            # ── Helper: safe float from dict ──────────────────────────────────
+            def _f(keys, fmt='.4f'):
+                for k in keys:
+                    v = last.get(k, '')
+                    if v:
                         try:
-                            acc_val = float(acc)
-                            self.accuracy_label.config(text=f"Global Accuracy: {acc_val:.4f}")
+                            return format(float(v), fmt)
                         except ValueError:
-                            self.accuracy_label.config(text=f"Global Accuracy: {acc}")
-            except Exception as e:
-                pass
+                            return v
+                return 'N/A'
+
+            # ── Accuracy ──────────────────────────────────────────────────
+            acc_val = _f(['global_accuracy', 'accuracy'])
+            if hasattr(self, 'accuracy_label'):
+                self.accuracy_label.config(text=acc_val)
+
+            # ── F1-Score ─────────────────────────────────────────────────
+            f1_val = _f(['global_f1_score', 'f1_score', 'f1'])
+            if hasattr(self, 'f1_label'):
+                self.f1_label.config(text=f1_val)
+
+            # ── Loss ───────────────────────────────────────────────────────
+            loss_val = _f(['global_loss', 'loss'], '.4f')
+            if hasattr(self, 'loss_label'):
+                self.loss_label.config(text=loss_val)
+
+            # ── DP Epsilon ───────────────────────────────────────────────
+            eps_raw = next(
+                (last[k] for k in last if 'epsilon' in k and last[k]), None
+            )
+            if hasattr(self, 'epsilon_label') and eps_raw:
+                try:
+                    eps_f = float(eps_raw)
+                    self.epsilon_label.config(text=f'{eps_f:.4f}')
+
+                    # Colour-coded badge
+                    if hasattr(self, 'epsilon_badge'):
+                        if eps_f < 1.0:
+                            badge_col, badge_txt = '#2ecc71', '● STRONG  (ε<1)'
+                        elif eps_f < 10.0:
+                            badge_col, badge_txt = '#f39c12', '● MODERATE (1≤ε<10)'
+                        else:
+                            badge_col, badge_txt = '#e74c3c', '● WEAK     (ε≥10)'
+                        self.epsilon_badge.config(text=badge_txt, bg=badge_col)
+                except ValueError:
+                    self.epsilon_label.config(text=eps_raw)
+
+            # ── Clients flagged by reputation system ─────────────────────
+            flagged_raw = next(
+                (last[k] for k in last if 'flag' in k and last[k]), None
+            )
+            if hasattr(self, 'flagged_label') and flagged_raw:
+                try:
+                    n = int(float(flagged_raw))
+                    colour = '#e74c3c' if n > 0 else '#2ecc71'
+                    self.flagged_label.config(text=str(n), fg=colour)
+                except ValueError:
+                    self.flagged_label.config(text=flagged_raw)
+
+        except Exception:
+            pass
+
 
     # ==============================================================================
     # 4. CRYPTO VIEW
@@ -658,7 +824,7 @@ class PQCDashboard(tk.Tk):
         script_path = config.BASE_DIR / 'crypto' / 'crypto_benchmark.py'
         try:
             process = subprocess.Popen(
-                [sys.executable, str(script_path)],
+                [sys.executable, '-u', str(script_path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True
@@ -735,11 +901,11 @@ class PQCDashboard(tk.Tk):
         
         self.figure_var = tk.StringVar()
         self.figure_map = {
-            "Confusion Matrix": "confusion_matrix.png",
-            "ROC Curve": "roc_curve.png",
-            "F1 Comparison": "f1_score_comparison.png",
-            "Crypto Benchmark": "crypto_comparison.png",
-            "Convergence Curve": "fl_convergence.png"
+            "Confusion Matrix": "fig1_confusion_matrix.png",
+            "ROC Curve": "fig2_roc_curves.png",
+            "F1 Comparison": "fig3_f1_comparison.png",
+            "Crypto Benchmark": "fig4_crypto_overhead.png",
+            "Convergence Curve": "fig5_convergence_curve.png"
         }
         
         self.fig_combo = ttk.Combobox(
@@ -922,12 +1088,16 @@ class PQCDashboard(tk.Tk):
     def animate_sim_arrows(self):
         active = getattr(self, 'is_federating', False) or self.sim_federating
         
+        if not hasattr(self, '_sim_blink_state'):
+            self._sim_blink_state = False
+        self._sim_blink_state = not self._sim_blink_state
+        
         if not active:
             if hasattr(self, 'sim_server_arrows'):
                 for arr in self.sim_server_arrows:
                     self.sim_canvas.itemconfig(arr, fill="gray")
         else:
-            color = "#2ecc71" if int(time.time() * 2) % 2 == 0 else "gray"
+            color = "#2ecc71" if self._sim_blink_state else "gray"
             if hasattr(self, 'sim_server_arrows'):
                 for arr in self.sim_server_arrows:
                     self.sim_canvas.itemconfig(arr, fill=color)
@@ -960,10 +1130,169 @@ class PQCDashboard(tk.Tk):
             self.sim_canvas.itemconfig(node, fill="#2ecc71")
             self.sim_attack_btn.state(['!disabled'])
 
+
     # ==============================================================================
-    # 7. PLACEHOLDER VIEW (Default Route)
+    # 7. PREPROCESSING VIEW
+    # ==============================================================================
+    def build_preprocessing_view(self):
+        action_frame = ttk.LabelFrame(self.content_frame, text=" Preprocessing Execution ", padding=20)
+        action_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.prep_btn = ttk.Button(
+            action_frame, 
+            text="▶ Run Preprocessing Pipeline", 
+            command=self.run_preprocessing
+        )
+        self.prep_btn.pack(anchor=tk.W, pady=(0, 15), ipady=5, ipadx=10)
+        
+        self.prep_log_area = tk.Text(action_frame, height=20, width=80, state=tk.DISABLED, bg=self.bg_main, fg=self.fg_main, font=("Consolas", 10), relief=tk.FLAT)
+        self.prep_log_area.pack(fill=tk.BOTH, expand=True)
+
+    def log_prep_msg(self, message):
+        self.prep_log_area.config(state=tk.NORMAL)
+        self.prep_log_area.insert(tk.END, message + "\n")
+        self.prep_log_area.see(tk.END)
+        self.prep_log_area.config(state=tk.DISABLED)
+
+    def run_preprocessing(self):
+        self.prep_btn.state(['disabled'])
+        threading.Thread(target=self._run_preprocessing_thread, daemon=True).start()
+
+    def _run_preprocessing_thread(self):
+        self.after(0, self.prep_log_area.config, {'state': tk.NORMAL})
+        self.after(0, self.prep_log_area.delete, '1.0', tk.END)
+        self.after(0, self.prep_log_area.config, {'state': tk.DISABLED})
+        
+        self.after(0, self.log_prep_msg, ">>> Executing: python preprocess.py")
+        script_path = config.BASE_DIR / 'preprocess.py'
+        try:
+            process = subprocess.Popen(
+                [sys.executable, '-u', str(script_path)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True
+            )
+            for line in iter(process.stdout.readline, ''):
+                self.after(0, self.log_prep_msg, line.strip())
+            process.wait()
+            if process.returncode == 0:
+                self.after(0, self.log_prep_msg, "\n[SUCCESS] Preprocessing completed.")
+            else:
+                self.after(0, self.log_prep_msg, f"\n[ERROR] Process crashed with exit code {process.returncode}")
+        except Exception as e:
+            self.after(0, self.log_prep_msg, f"[FATAL EXCEPTION] {str(e)}")
+            
+        self.after(0, lambda: self.prep_btn.state(['!disabled']))
+
+    # ==============================================================================
+    # 8. BENCHMARK VIEW
+    # ==============================================================================
+    def build_benchmark_view(self):
+        action_frame = ttk.LabelFrame(self.content_frame, text=" Benchmark Execution ", padding=20)
+        action_frame.pack(fill=tk.BOTH, expand=True)
+        
+        btn_frame = ttk.Frame(action_frame)
+        btn_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        self.bench_btn1 = ttk.Button(btn_frame, text="▶ Run Core Benchmark", command=lambda: self.run_benchmark('benchmark/run_benchmark.py'))
+        self.bench_btn1.pack(side=tk.LEFT, padx=(0, 10), ipady=5, ipadx=10)
+        
+        self.bench_btn2 = ttk.Button(btn_frame, text="▶ Run Cross-Dataset Test", command=lambda: self.run_benchmark('benchmark/cross_dataset_test.py'))
+        self.bench_btn2.pack(side=tk.LEFT, ipady=5, ipadx=10)
+        
+        self.bench_log_area = tk.Text(action_frame, height=20, width=80, state=tk.DISABLED, bg=self.bg_main, fg=self.fg_main, font=("Consolas", 10), relief=tk.FLAT)
+        self.bench_log_area.pack(fill=tk.BOTH, expand=True)
+
+    def log_bench_msg(self, message):
+        self.bench_log_area.config(state=tk.NORMAL)
+        self.bench_log_area.insert(tk.END, message + "\n")
+        self.bench_log_area.see(tk.END)
+        self.bench_log_area.config(state=tk.DISABLED)
+
+    def run_benchmark(self, script_rel_path):
+        self.bench_btn1.state(['disabled'])
+        self.bench_btn2.state(['disabled'])
+        threading.Thread(target=self._run_benchmark_thread, args=(script_rel_path,), daemon=True).start()
+
+    def _run_benchmark_thread(self, script_rel_path):
+        self.after(0, self.bench_log_area.config, {'state': tk.NORMAL})
+        self.after(0, self.bench_log_area.delete, '1.0', tk.END)
+        self.after(0, self.bench_log_area.config, {'state': tk.DISABLED})
+        
+        self.after(0, self.log_bench_msg, f">>> Executing: python {script_rel_path}")
+        script_path = config.BASE_DIR / script_rel_path
+        try:
+            process = subprocess.Popen(
+                [sys.executable, '-u', str(script_path)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True
+            )
+            for line in iter(process.stdout.readline, ''):
+                self.after(0, self.log_bench_msg, line.strip())
+            process.wait()
+            if process.returncode == 0:
+                self.after(0, self.log_bench_msg, "\n[SUCCESS] Benchmark completed.")
+            else:
+                self.after(0, self.log_bench_msg, f"\n[ERROR] Process crashed with exit code {process.returncode}")
+        except Exception as e:
+            self.after(0, self.log_bench_msg, f"[FATAL EXCEPTION] {str(e)}")
+            
+        self.after(0, lambda: self.bench_btn1.state(['!disabled']))
+        self.after(0, lambda: self.bench_btn2.state(['!disabled']))
+
+    # ==============================================================================
+    # 9. PAPER FIGURES VIEW
+    # ==============================================================================
+    def build_figures_view(self):
+        action_frame = ttk.LabelFrame(self.content_frame, text=" Paper Figures Generation ", padding=20)
+        action_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.fig_btn = ttk.Button(
+            action_frame, 
+            text="▶ Generate Paper Figures", 
+            command=self.run_figures
+        )
+        self.fig_btn.pack(anchor=tk.W, pady=(0, 15), ipady=5, ipadx=10)
+        
+        self.fig_log_area = tk.Text(action_frame, height=20, width=80, state=tk.DISABLED, bg=self.bg_main, fg=self.fg_main, font=("Consolas", 10), relief=tk.FLAT)
+        self.fig_log_area.pack(fill=tk.BOTH, expand=True)
+
+    def log_fig_msg(self, message):
+        self.fig_log_area.config(state=tk.NORMAL)
+        self.fig_log_area.insert(tk.END, message + "\n")
+        self.fig_log_area.see(tk.END)
+        self.fig_log_area.config(state=tk.DISABLED)
+
+    def run_figures(self):
+        self.fig_btn.state(['disabled'])
+        threading.Thread(target=self._run_figures_thread, daemon=True).start()
+
+    def _run_figures_thread(self):
+        self.after(0, self.fig_log_area.config, {'state': tk.NORMAL})
+        self.after(0, self.fig_log_area.delete, '1.0', tk.END)
+        self.after(0, self.fig_log_area.config, {'state': tk.DISABLED})
+        
+        self.after(0, self.log_fig_msg, ">>> Executing: python results/generate_paper_figures.py")
+        script_path = config.BASE_DIR / 'results' / 'generate_paper_figures.py'
+        try:
+            process = subprocess.Popen(
+                [sys.executable, '-u', str(script_path)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True
+            )
+            for line in iter(process.stdout.readline, ''):
+                self.after(0, self.log_fig_msg, line.strip())
+            process.wait()
+            if process.returncode == 0:
+                self.after(0, self.log_fig_msg, "\n[SUCCESS] Figures generated perfectly.")
+            else:
+                self.after(0, self.log_fig_msg, f"\n[ERROR] Process crashed with exit code {process.returncode}")
+        except Exception as e:
+            self.after(0, self.log_fig_msg, f"[FATAL EXCEPTION] {str(e)}")
+            
+        self.after(0, lambda: self.fig_btn.state(['!disabled']))
+
+    # ==============================================================================
+    # 10. PLACEHOLDER VIEW (Default Route)
     # ==============================================================================
     def build_placeholder_view(self, view_name):
+
         action_frame = ttk.LabelFrame(self.content_frame, text=" Module Execution Context ", padding=20)
         action_frame.pack(fill=tk.BOTH, expand=True)
         

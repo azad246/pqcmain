@@ -1,6 +1,7 @@
 import subprocess
 import time
 import sys
+import shutil
 from pathlib import Path
 
 # Setup relative paths dynamically
@@ -10,6 +11,12 @@ CLIENT_SCRIPT = BASE_DIR / 'federated' / 'fl_client.py'
 
 def launch_federation():
     print(">>> Starting Federated Learning Orchestration Pipeline\n")
+    
+    # Clean up stale keys from previous runs
+    keys_dir = BASE_DIR / 'keys'
+    if keys_dir.exists():
+        shutil.rmtree(keys_dir)
+        
     processes = []
     
     try:

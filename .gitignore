@@ -65,6 +65,7 @@ models/*.h5
 models/*.pth
 models/*.pt
 models/*.joblib
+models/*.keras
 *.pkl
 *.h5
 *.pth
@@ -74,6 +75,7 @@ models/*.joblib
 # Results and Logs
 results/*.json
 results/*.txt
+results/paper_figures/
 logs/*.log
 logs/
 

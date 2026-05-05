@@ -1,3 +1,20 @@
+"""
+federated/fl_client.py
+======================
+PQC-secured Flower FL Client with Differential Privacy via Opacus.
+
+Key changes vs previous version:
+  - MLPClassifier (sklearn) replaced by a PyTorch nn.Module MLP so that
+    Opacus PrivacyEngine can hook into the autograd graph for per-sample
+    gradient clipping + Gaussian noise addition.
+  - PrivacyEngine is initialised once per client in __init__ and attached
+    to the model, optimizer, and DataLoader each round inside fit().
+  - After training, the spent privacy budget (epsilon) is extracted from
+    the accountant and returned to the server inside the fit() metrics dict.
+  - Weighted FedAvg metrics (local_f1, local_loss) are still reported.
+  - PQC encryption/decryption unchanged.
+"""
+
 import argparse
 import sys
 import json
@@ -8,8 +25,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import flwr as fl
-from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import log_loss, accuracy_score, f1_score
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+
+from opacus import PrivacyEngine
 
 warnings.filterwarnings('ignore')
 
@@ -18,134 +41,337 @@ import config
 from crypto import pqc_crypto
 from crypto.encrypt_weights import encrypt_weights, decrypt_weights
 
-def get_model_parameters(model):
-    if hasattr(model, 'coefs_'):
-        return model.coefs_ + model.intercepts_
-    return []
 
-def set_model_parameters(model, parameters):
-    if not parameters: return
-    n_layers = len(parameters) // 2
-    model.coefs_ = parameters[:n_layers]
-    model.intercepts_ = parameters[n_layers:]
+# ---------------------------------------------------------------------------
+# DP hyper-parameters  (tune per privacy budget requirements)
+# ---------------------------------------------------------------------------
+DP_MAX_GRAD_NORM    = 1.0    # per-sample gradient clipping bound (C)
+DP_NOISE_MULTIPLIER = 0.8    # Gaussian noise σ relative to sensitivity (σ / C)
+DP_DELTA            = 1e-5   # δ for (ε, δ)-DP guarantee
+DP_BATCH_SIZE       = 256    # must match DataLoader batch size for accountant
+DP_LOCAL_EPOCHS     = 1      # local epochs per FL round
+
+
+# ==============================================================================
+# PyTorch MLP — equivalent to sklearn MLPClassifier(128, 64)
+# ==============================================================================
+
+class MLP(nn.Module):
+    """
+    Simple feed-forward MLP compatible with Opacus.
+    Opacus requires:
+      - No in-place operations
+      - No BatchNorm (use GroupNorm or no norm)
+      - Single input tensor per forward pass
+    """
+
+    def __init__(self, input_dim: int, num_classes: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ==============================================================================
+# Weight extraction / injection helpers
+# ==============================================================================
+
+def get_model_parameters(model: nn.Module) -> list[np.ndarray]:
+    """Return all trainable parameters as a flat list of numpy arrays."""
+    return [p.detach().cpu().numpy() for p in model.parameters()]
+
+
+def set_model_parameters(model: nn.Module, parameters: list[np.ndarray]):
+    """Load a flat list of numpy arrays back into the model in-place."""
+    with torch.no_grad():
+        for param, new_val in zip(model.parameters(), parameters):
+            param.copy_(torch.tensor(new_val, dtype=param.dtype))
+
+
+# ==============================================================================
+# FL Client
+# ==============================================================================
 
 class PQC_FLClient(fl.client.NumPyClient):
-    def __init__(self, node_id):
-        self.node_id = node_id
-        self.keys_dir = config.BASE_DIR / 'keys'
+
+    def __init__(self, node_id: int):
+        self.node_id   = node_id
+        self.keys_dir  = config.BASE_DIR / 'keys'
         self.keys_dir.mkdir(parents=True, exist_ok=True)
-        
-        # --- 1. PQC KEY GENERATION ---
-        print(f">>> [Node {self.node_id}] Generating Client PQC Keypair...")
+
+        # Cumulative privacy budget across all rounds
+        self.total_epsilon: float = 0.0
+
+        # --- 1. PQC KEY GENERATION (KEM) ---
+        print(f">>> [Node {self.node_id}] Generating Client KEM Keypair (Kyber512)...")
         self.client_pub, self.client_sec = pqc_crypto.generate_keypair()
-        
         with open(self.keys_dir / f'client_{self.node_id}_pub.pem', 'wb') as f:
             f.write(self.client_pub)
-            
+
+        # --- 2. DILITHIUM2 SIGNING KEYPAIR ---
+        print(f">>> [Node {self.node_id}] Generating Client Signing Keypair (Dilithium2)...")
+        self.signing_pub, self.signing_sec = pqc_crypto.generate_signing_keypair()
+        # Publish the signing public key so the server can verify our updates
+        with open(self.keys_dir / f'client_{self.node_id}_signing_pub.bin', 'wb') as f:
+            f.write(self.signing_pub)
+
         self.load_data()
         self.init_model()
 
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+
     def load_data(self):
         print(f"[Node {self.node_id}] Loading local training and validation data...")
-        nodes_dir = config.BASE_DIR / 'datasets' / 'processed' / 'nodes'
+        nodes_dir  = config.BASE_DIR / 'datasets' / 'processed' / 'nodes'
         train_path = nodes_dir / f'node{self.node_id}_train.csv'
-        val_path = nodes_dir / f'node{self.node_id}_val.csv'
-        
+        val_path   = nodes_dir / f'node{self.node_id}_val.csv'
+
         train_df = pd.read_csv(train_path, low_memory=False)
-        val_df = pd.read_csv(val_path, low_memory=False)
-        
-        self.X_train = train_df.drop(columns=['label']).values
-        self.y_train = train_df['label'].values
-        self.X_val = val_df.drop(columns=['label']).values
-        self.y_val = val_df['label'].values
-        
+        val_df   = pd.read_csv(val_path,   low_memory=False)
+
+        self.X_train = train_df.drop(columns=['label']).values.astype(np.float32)
+        self.y_train = train_df['label'].values.astype(np.int64)
+        self.X_val   = val_df.drop(columns=['label']).values.astype(np.float32)
+        self.y_val   = val_df['label'].values.astype(np.int64)
+
         mapping_path = nodes_dir / f'node{self.node_id}_label_mapping.json'
         with open(mapping_path, 'r') as f:
             mapping = json.load(f)
-            
-        self.total_classes = np.arange(len(mapping))
+
+        self.num_classes    = len(mapping)
+        self.total_classes  = np.arange(self.num_classes)
+        self.input_dim      = self.X_train.shape[1]
+
+        # Build a persistent validation DataLoader (no DP wrapping needed)
+        val_ds  = TensorDataset(
+            torch.tensor(self.X_val), torch.tensor(self.y_val)
+        )
+        self.val_loader = DataLoader(val_ds, batch_size=512, shuffle=False)
+
+    # ------------------------------------------------------------------
+    # Model initialisation
+    # ------------------------------------------------------------------
 
     def init_model(self):
-        self.model = MLPClassifier(
-            hidden_layer_sizes=(128, 64), max_iter=1, warm_start=True, random_state=config.RANDOM_SEED
-        )
-        self.model.partial_fit(self.X_train[:10], self.y_train[:10], classes=self.total_classes)
+        self.device = torch.device('cpu')   # FL on IoT nodes → CPU
+        self.model  = MLP(self.input_dim, self.num_classes).to(self.device)
 
-    def get_parameters(self, config_dict):
-        # Allow initial parameter probing by the server in raw format
+        # PrivacyEngine is attached fresh each round inside fit()
+        # (Opacus requires re-wrapping when the model changes)
+        self.privacy_engine = PrivacyEngine()
+        print(f"[Node {self.node_id}] PyTorch MLP initialised  "
+              f"(input={self.input_dim}  classes={self.num_classes})")
+
+    # ------------------------------------------------------------------
+    # Flower: get_parameters
+    # ------------------------------------------------------------------
+
+    def get_parameters(self, config):
         return get_model_parameters(self.model)
 
+    # ------------------------------------------------------------------
+    # Flower: set_parameters  (PQC decryption intercept)
+    # ------------------------------------------------------------------
+
     def set_parameters(self, parameters):
-        if not parameters: return
-        
-        # --- 2. PQC DECRYPTION INTERCEPT ---
-        # Identify if this is a secure PQC bundle from the Server
+        if not parameters:
+            return
+
+        # Detect a PQC-encrypted bundle from the server
         is_encrypted_bundle = (
-            len(parameters) == config.NUM_NODES and 
-            parameters[0].dtype == np.uint8 and 
-            parameters[0].ndim == 1
+            len(parameters) == config.NUM_NODES
+            and parameters[0].dtype == np.uint8
+            and parameters[0].ndim == 1
         )
-        
+
         if is_encrypted_bundle:
             print(f"[Node {self.node_id}] Decrypting PQC global weights from Server...")
-            
-            # Extract the specific encrypted payload meant exclusively for this node
             my_encrypted_bytes = parameters[self.node_id - 1].tobytes()
-            
-            decrypted_weights = decrypt_weights(my_encrypted_bytes, self.client_sec)
+            decrypted_weights  = decrypt_weights(my_encrypted_bytes, self.client_sec)
             set_model_parameters(self.model, decrypted_weights)
         else:
             set_model_parameters(self.model, parameters)
 
-    def fit(self, parameters, fit_config):
+    # ------------------------------------------------------------------
+    # Flower: fit  (DP training + PQC encryption)
+    # ------------------------------------------------------------------
+
+    def fit(self, parameters, config):
         self.set_parameters(parameters)
-        self.model.partial_fit(self.X_train, self.y_train)
-        
-        raw_weights = get_model_parameters(self.model)
-        
-        # --- 3. PQC ENCRYPTION INTERCEPT ---
+
+        # ── STEP 1: Build a fresh DataLoader for this round ────────────
+        # Opacus requires a new DataLoader each time make_private() is called
+        train_ds     = TensorDataset(
+            torch.tensor(self.X_train), torch.tensor(self.y_train)
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=DP_BATCH_SIZE,
+            shuffle=True,
+            drop_last=True,   # Opacus accountant requires fixed batch sizes
+        )
+
+        # ── STEP 2: Attach PrivacyEngine (Opacus DP wrapping) ─────────
+        #
+        # make_private() returns:
+        #   dp_model    — wrapped model with per-sample gradient hooks
+        #   dp_optimizer — wrapped optimizer that clips + adds noise
+        #   dp_loader   — wrapped DataLoader with Poisson sampling
+        #
+        optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+        criterion = nn.CrossEntropyLoss()
+
+        dp_model, dp_optimizer, dp_loader = self.privacy_engine.make_private(
+            module=self.model,
+            optimizer=optimizer,
+            data_loader=train_loader,
+            noise_multiplier=DP_NOISE_MULTIPLIER,
+            max_grad_norm=DP_MAX_GRAD_NORM,
+        )
+
+        # ── STEP 3: Local DP training ──────────────────────────────────
+        dp_model.train()
+        for epoch in range(DP_LOCAL_EPOCHS):
+            epoch_loss = 0.0
+            batches    = 0
+            for X_batch, y_batch in dp_loader:
+                X_batch = X_batch.to(self.device)
+                y_batch = y_batch.to(self.device)
+
+                dp_optimizer.zero_grad()
+                logits = dp_model(X_batch)
+                loss   = criterion(logits, y_batch)
+                loss.backward()
+                dp_optimizer.step()
+
+                epoch_loss += loss.item()
+                batches    += 1
+
+            if batches:
+                print(f"[Node {self.node_id}] DP Epoch {epoch+1}/{DP_LOCAL_EPOCHS}  "
+                      f"avg_loss={epoch_loss/batches:.4f}")
+
+        # ── STEP 4: Extract spent privacy budget ───────────────────────
+        # get_epsilon() returns the cumulative ε for the target δ
+        epsilon = self.privacy_engine.get_epsilon(delta=DP_DELTA)
+        self.total_epsilon = epsilon
+        print(f"[Node {self.node_id}] DP Privacy Budget spent: ε={epsilon:.4f}  δ={DP_DELTA}")
+
+        # ── STEP 5: Extract updated weights from the DP-wrapped model ──
+        # dp_model is a GradSampleModule wrapper; _module is the original MLP
+        raw_weights = get_model_parameters(dp_model._module)
+
+        # ── STEP 6: Local evaluation (for Weighted FedAvg weight) ──────
+        dp_model.eval()
+        all_preds, all_probs, all_true = [], [], []
+        with torch.no_grad():
+            for X_b, y_b in self.val_loader:
+                logits = dp_model._module(X_b.to(self.device))
+                probs  = torch.softmax(logits, dim=1).cpu().numpy()
+                preds  = np.argmax(probs, axis=1)
+                all_probs.extend(probs.tolist())
+                all_preds.extend(preds.tolist())
+                all_true.extend(y_b.numpy().tolist())
+
+        local_f1 = float(f1_score(all_true, all_preds, average='weighted', zero_division=0))
+        try:
+            local_loss = float(log_loss(all_true, all_probs, labels=list(self.total_classes)))
+        except Exception:
+            local_loss = 1.0
+        print(f"[Node {self.node_id}] Val F1={local_f1:.4f}  loss={local_loss:.4f}")
+
+        # ── STEP 7: PQC encryption before sending to server ────────────
         server_pub_path = self.keys_dir / 'server_pub.pem'
         while not server_pub_path.exists():
             time.sleep(1)
-            
         with open(server_pub_path, 'rb') as f:
             server_pub = f.read()
-            
-        print(f"[Node {self.node_id}] Encrypting local updates for Server using PQC...")
-        encrypted_bytes = encrypt_weights(raw_weights, server_pub)
-        
-        # Wrap the byte stream natively into a NumPy wrapper so Flower can transport it over gRPC
-        encrypted_parameters = [np.frombuffer(encrypted_bytes, dtype=np.uint8)]
-        
-        return encrypted_parameters, len(self.X_train), {}
 
-    def evaluate(self, parameters, eval_config):
+        print(f"[Node {self.node_id}] Encrypting local updates for Server using PQC...")
+        encrypted_bytes      = encrypt_weights(raw_weights, server_pub)
+        encrypted_parameters = [np.frombuffer(encrypted_bytes, dtype=np.uint8)]
+
+        # ── STEP 8: Sign the encrypted bytes with Dilithium2 ───────────
+        # Signature is over the post-encryption bytes so it covers exactly
+        # what the server receives — any relay-level tampering is detectable.
+        signature = pqc_crypto.sign_weights(encrypted_bytes, self.signing_sec)
+        print(f"[Node {self.node_id}] Signed payload  "
+              f"(sig={len(signature)}B  alg=Dilithium2/RSA-PSS-fallback)")
+
+        # ── STEP 9: Build metrics dict ─────────────────────────────────
+        fit_metrics = {
+            "local_f1":          local_f1,
+            "local_loss":        local_loss,
+            "dp_epsilon":        round(epsilon, 6),
+            "dp_delta":          DP_DELTA,
+            "dp_noise_mult":     DP_NOISE_MULTIPLIER,
+            "dp_max_grad_norm":  DP_MAX_GRAD_NORM,
+            # Signature fields — server reads these for verification
+            "signature":         signature.hex(),          # bytes → hex str (JSON-safe)
+            "signing_pub_key":   self.signing_pub.hex(),   # bytes → hex str
+        }
+        return encrypted_parameters, len(self.X_train), fit_metrics
+
+    # ------------------------------------------------------------------
+    # Flower: evaluate
+    # ------------------------------------------------------------------
+
+    def evaluate(self, parameters, config):
         self.set_parameters(parameters)
-        
-        y_pred = self.model.predict(self.X_val)
-        y_prob = self.model.predict_proba(self.X_val)
-        
+        self.model.eval()
+
+        all_preds, all_probs, all_true = [], [], []
+        with torch.no_grad():
+            for X_b, y_b in self.val_loader:
+                logits = self.model(X_b.to(self.device))
+                probs  = torch.softmax(logits, dim=1).cpu().numpy()
+                preds  = np.argmax(probs, axis=1)
+                all_probs.extend(probs.tolist())
+                all_preds.extend(preds.tolist())
+                all_true.extend(y_b.numpy().tolist())
+
         try:
-            loss = log_loss(self.y_val, y_prob, labels=self.total_classes)
+            loss = float(log_loss(all_true, all_probs, labels=list(self.total_classes)))
         except Exception:
             loss = 1.0
-            
-        accuracy = accuracy_score(self.y_val, y_pred)
-        f1 = f1_score(self.y_val, y_pred, average='weighted', zero_division=0)
-        
-        metrics = {"accuracy": float(accuracy), "f1": float(f1)}
-        return float(loss), len(self.X_val), metrics
+
+        accuracy = float(accuracy_score(all_true, all_preds))
+        f1       = float(f1_score(all_true, all_preds, average='weighted', zero_division=0))
+
+        metrics = {
+            "accuracy":   accuracy,
+            "f1":         f1,
+            "dp_epsilon": round(self.total_epsilon, 6),
+        }
+        return loss, len(self.X_val), metrics
+
+
+# ==============================================================================
+# Entry point
+# ==============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PQC Flower FL Client")
-    parser.add_argument("--node_id", type=int, required=True, help="Node ID (e.g., 1, 2, 3)")
-    parser.add_argument("--server_address", type=str, default="127.0.0.1:8080", help="FL Server Address")
+    parser = argparse.ArgumentParser(description="PQC + DP Flower FL Client")
+    parser.add_argument("--node_id",        type=int, required=True,
+                        help="Node ID (e.g., 1, 2, 3)")
+    parser.add_argument("--server_address", type=str, default="127.0.0.1:8080",
+                        help="FL Server address")
     args = parser.parse_args()
-    
-    print("="*60)
-    print(f"Starting Secure PQC Flower Client for Node {args.node_id}")
-    print("="*60)
-    
+
+    print("=" * 60)
+    print(f"Starting Secure PQC + DP Flower Client for Node {args.node_id}")
+    print(f"DP config: noise_mult={DP_NOISE_MULTIPLIER}  "
+          f"max_grad_norm={DP_MAX_GRAD_NORM}  delta={DP_DELTA}")
+    print("=" * 60)
+
     client = PQC_FLClient(node_id=args.node_id)
-    
     fl.client.start_numpy_client(server_address=args.server_address, client=client)

@@ -164,42 +164,222 @@ class PQCManager:
             print(f"Secret Key Size: 2048 bits")
         print("="*50 + "\n")
 
-# -------------------------------------------------------------------------
-# Exposed Module API
-# -------------------------------------------------------------------------
-_default_manager = PQCManager()
+# =========================================================================
+# DIGITAL SIGNATURES — Dilithium2 (PQC) with RSA-PSS fallback
+# =========================================================================
 
-def generate_keypair(algorithm='Kyber512'):
+class SignatureManager:
+    """
+    Post-Quantum digital signature support using Dilithium2 via liboqs.
+    Falls back to RSA-PSS (SHA-256) when liboqs is unavailable.
+
+    Signing flow:
+      1. SHA-256 hash of the raw weight bytes is computed.
+      2. Dilithium2 (or RSA-PSS) signs that digest.
+      3. The signature is returned as raw bytes.
+
+    Verification flow:
+      1. SHA-256 hash of received bytes is computed.
+      2. Dilithium2 (or RSA-PSS) verifies signature against the digest.
+      3. Returns True only if the signature is valid — any tampering returns False.
+    """
+
+    SIG_ALGORITHM = 'Dilithium2'
+
+    def __init__(self):
+        self.use_pqc = False
+        if PQC_AVAILABLE:
+            try:
+                with oqs.Signature(self.SIG_ALGORITHM) as _sig:
+                    self.sig_name        = _sig.details['name']
+                    self.pub_key_length  = _sig.details['length_public_key']
+                    self.sec_key_length  = _sig.details['length_secret_key']
+                    self.sig_length      = _sig.details['length_signature']
+                self.use_pqc = True
+                print(f"[SignatureManager] Dilithium2 available — "
+                      f"pub={self.pub_key_length}B  "
+                      f"sec={self.sec_key_length}B  "
+                      f"sig={self.sig_length}B")
+            except Exception as exc:
+                print(f"[SignatureManager] Dilithium2 unavailable ({exc}); "
+                      f"falling back to RSA-PSS.")
+        if not self.use_pqc:
+            self.sig_name = 'RSA-PSS-2048 (Fallback)'
+            print(f"[SignatureManager] Using {self.sig_name}")
+
+    # ------------------------------------------------------------------
+    def generate_signing_keypair(self) -> tuple[bytes, bytes]:
+        """Return (signing_public_key, signing_secret_key) as raw bytes."""
+        if self.use_pqc:
+            with oqs.Signature(self.SIG_ALGORITHM) as sig:
+                pub = sig.generate_keypair()
+                sec = sig.export_secret_key()
+            return pub, sec
+        else:
+            # RSA-PSS fallback — reuse the serialisation from PQCManager
+            sk  = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            pub = sk.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            sec = sk.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+            return pub, sec
+
+    # ------------------------------------------------------------------
+    def sign(self, data_bytes: bytes, secret_key: bytes) -> bytes:
+        """
+        Sign `data_bytes` with `secret_key`.
+        Returns the raw signature bytes.
+        """
+        digest = hashlib.sha256(data_bytes).digest()
+        if self.use_pqc:
+            with oqs.Signature(self.SIG_ALGORITHM, secret_key) as sig:
+                return sig.sign(digest)
+        else:
+            sk = serialization.load_pem_private_key(secret_key, password=None)
+            return sk.sign(
+                digest,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH,
+                ),
+                hashes.Prehashed(hashes.SHA256()),
+            )
+
+    # ------------------------------------------------------------------
+    def verify(self, data_bytes: bytes, signature: bytes, public_key: bytes) -> bool:
+        """
+        Verify `signature` over `data_bytes` using `public_key`.
+        Returns True if valid, False for any tampered / mismatched input.
+        """
+        digest = hashlib.sha256(data_bytes).digest()
+        try:
+            if self.use_pqc:
+                with oqs.Signature(self.SIG_ALGORITHM) as sig:
+                    return sig.verify(digest, signature, public_key)
+            else:
+                pk = serialization.load_pem_public_key(public_key)
+                pk.verify(
+                    signature,
+                    digest,
+                    padding.PSS(
+                        mgf=padding.MGF1(hashes.SHA256()),
+                        salt_length=padding.PSS.MAX_LENGTH,
+                    ),
+                    hashes.Prehashed(hashes.SHA256()),
+                )
+                return True
+        except Exception:
+            return False
+
+
+# =========================================================================
+# Exposed Module API
+# =========================================================================
+_default_manager   = PQCManager()
+_signature_manager = SignatureManager()
+
+
+# --- KEM (Key Encapsulation) API ---
+
+def generate_keypair(algorithm: str = 'Kyber512') -> tuple[bytes, bytes]:
+    """Generate a Kyber512 KEM keypair (or RSA fallback)."""
     if algorithm != _default_manager.algorithm and PQC_AVAILABLE:
-        # Re-initialize on-the-fly if a different algorithm is requested
-        custom_manager = PQCManager(algorithm=algorithm)
-        return custom_manager.generate_keypair()
+        return PQCManager(algorithm=algorithm).generate_keypair()
     return _default_manager.generate_keypair()
 
-def encrypt_data(data_bytes, public_key):
+def encrypt_data(data_bytes: bytes, public_key: bytes) -> bytes:
+    """Hybrid-encrypt data with the recipient's KEM public key."""
     return _default_manager.encrypt_data(data_bytes, public_key)
 
-def decrypt_data(ciphertext, secret_key):
+def decrypt_data(ciphertext: bytes, secret_key: bytes) -> bytes:
+    """Hybrid-decrypt a KEM-encrypted bundle."""
     return _default_manager.decrypt_data(ciphertext, secret_key)
 
 def get_algorithm_info():
+    """Print cryptographic backend details."""
     _default_manager.get_algorithm_info()
 
-if __name__ == "__main__":
+
+# --- Signature (Dilithium2) API ---
+
+def generate_signing_keypair() -> tuple[bytes, bytes]:
+    """
+    Generate a Dilithium2 signing keypair (or RSA-PSS fallback).
+    Returns (signing_public_key, signing_secret_key).
+    """
+    return _signature_manager.generate_signing_keypair()
+
+def sign_weights(weights_bytes: bytes, private_key: bytes) -> bytes:
+    """
+    Sign a serialised weight payload with a Dilithium2 private key.
+
+    Parameters
+    ----------
+    weights_bytes : raw bytes of the serialised model weights
+    private_key   : Dilithium2 secret key returned by generate_signing_keypair()
+
+    Returns
+    -------
+    signature : raw signature bytes to be transmitted alongside the payload
+    """
+    return _signature_manager.sign(weights_bytes, private_key)
+
+def verify_weights(weights_bytes: bytes, signature: bytes, public_key: bytes) -> bool:
+    """
+    Verify a Dilithium2 signature over a weight payload.
+
+    Parameters
+    ----------
+    weights_bytes : the exact same bytes that were signed on the client
+    signature     : signature bytes returned by sign_weights()
+    public_key    : Dilithium2 public key of the signing client
+
+    Returns
+    -------
+    True  — payload is authentic and unmodified
+    False — signature invalid, payload tampered, or wrong key
+    """
+    return _signature_manager.verify(weights_bytes, signature, public_key)
+
+
+# =========================================================================
+# Self-test
+# =========================================================================
+
+if __name__ == '__main__':
     get_algorithm_info()
-    
-    # Built-in self-test to verify crypto integrity
-    print("Running Hybrid-Encryption Self-Test...")
+
+    # ── KEM self-test ──────────────────────────────────────────────────
+    print("\nRunning Hybrid-Encryption Self-Test...")
     pub, sec = generate_keypair()
-    
-    message = b"PQC-IoT Sentinel: Secure FL Model Weights Transmission Payload!"
-    print(f"Original Message: {message}")
-    
+    message   = b"PQC-IoT Sentinel: Secure FL Model Weights Transmission Payload!"
+    print(f"Original: {message}")
     ciphertext = encrypt_data(message, pub)
-    print(f"Encrypted Bundle Length: {len(ciphertext)} bytes")
-    
+    print(f"Encrypted bundle: {len(ciphertext)} bytes")
     decrypted = decrypt_data(ciphertext, sec)
-    print(f"Decrypted Message: {decrypted}")
-    
+    print(f"Decrypted: {decrypted}")
     assert message == decrypted, "[ERROR] Encryption/Decryption mismatch!"
-    print("\nSelf-test PASSED: Data encrypted and decrypted flawlessly.")
+    print("KEM self-test PASSED.")
+
+    # ── Signature self-test ────────────────────────────────────────────
+    print("\nRunning Dilithium2 Signature Self-Test...")
+    sig_pub, sig_sec = generate_signing_keypair()
+    payload  = b"FL weight bytes example payload"
+    sig      = sign_weights(payload, sig_sec)
+    print(f"Signature length: {len(sig)} bytes")
+
+    ok = verify_weights(payload, sig, sig_pub)
+    assert ok,  "[ERROR] Valid signature rejected!"
+    print("Valid signature accepted — PASSED.")
+
+    tampered = payload + b"X"
+    nok = verify_weights(tampered, sig, sig_pub)
+    assert not nok, "[ERROR] Tampered payload accepted!"
+    print("Tampered payload rejected  — PASSED.")
+    print("\nAll self-tests PASSED.")
+
