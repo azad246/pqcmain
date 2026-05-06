@@ -47,6 +47,12 @@ class PQCDashboard(tk.Tk):
         self.fg_sub = "#a6adc8"
         self.accent = "#89b4fa"
         
+        # Initialize privacy budget tracking
+        self.current_epsilon = 0.0
+        self.epsilon_budget = 1.0
+        self.sig_refresh_id = None
+        self.sim_rejection_text = None
+        
         style.configure(".", background=self.bg_main, foreground=self.fg_main, font=("Segoe UI", 10))
         style.configure("TFrame", background=self.bg_main)
         style.configure("TLabel", background=self.bg_main, foreground=self.fg_main)
@@ -74,7 +80,10 @@ class PQCDashboard(tk.Tk):
         self.create_status_bar()
         
         self.show_view("Dataset")
-        self.refresh_dashboard_data()
+
+    def refresh_dashboard_data(self):
+        """Refresh dashboard data - placeholder for initialization."""
+        pass
 
     def create_sidebar(self):
         self.sidebar_frame = ttk.Frame(self, width=250, padding=15, style="Sidebar.TFrame")
@@ -543,24 +552,21 @@ class PQCDashboard(tk.Tk):
         )
         eps_hint.grid(row=2, column=4, sticky=tk.W, padx=(4, 0), pady=(2, 0))
 
-        # --- Added: Privacy Budget Progress Bar ---
+        # ═════════════════════════════════════════════════════════════════════════
+        # FEATURE 1: Privacy Budget Progress Bar with Live Updates & Color-Coding
+        # ═════════════════════════════════════════════════════════════════════════
         pb_frame = ttk.Frame(metrics_frame, padding=(0, 10))
         pb_frame.grid(row=3, column=0, columnspan=5, sticky=tk.WE)
         
         ttk.Label(pb_frame, text="Privacy Budget Usage:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 10))
         
-        self.eps_progress = ttk.Progressbar(pb_frame, orient=tk.HORIZONTAL, length=400, mode='determinate', maximum=1.0)
-        self.eps_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        # Create progress bar with canvas background for custom coloring
+        self.eps_progress_canvas = tk.Canvas(pb_frame, width=400, height=20, bg="white", relief=tk.SUNKEN, bd=1)
+        self.eps_progress_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        self.eps_progress_rect = None  # Will hold the progress rectangle
         
-        self.eps_usage_lbl = ttk.Label(pb_frame, text="Privacy budget used: ε=0.00 / 1.0", font=("Segoe UI", 9))
+        self.eps_usage_lbl = tk.Label(pb_frame, text="Privacy budget used: ε=0.00 / 1.0", font=("Segoe UI", 9), fg=self.fg_main, bg=self.bg_main)
         self.eps_usage_lbl.pack(side=tk.LEFT)
-
-        # Style for epsilon progress bar colors
-        self.style = ttk.Style()
-        self.style.configure("Green.Horizontal.TProgressbar", foreground='#2ecc71', background='#2ecc71')
-        self.style.configure("Amber.Horizontal.TProgressbar", foreground='#f1c40f', background='#f1c40f')
-        self.style.configure("Red.Horizontal.TProgressbar", foreground='#e74c3c', background='#e74c3c')
-        self.eps_progress.configure(style="Green.Horizontal.TProgressbar")
 
 
         # Visual Frame
@@ -646,6 +652,15 @@ class PQCDashboard(tk.Tk):
         if hasattr(self, 'epsilon_badge'):
             self.epsilon_badge.config(text="● STARTING", bg="#6c757d")
         
+        # Reset privacy budget
+        self.current_epsilon = 0.0
+        self._update_privacy_budget_display()
+        
+        # Reset signature verification status
+        for i in range(1, 4):
+            if i in self.sig_status_widgets:
+                self.sig_status_widgets[i].config(text="○ Monitoring...", fg=self.fg_sub)
+        
         metrics_file = config.RESULTS_PATH / "fl_round_metrics.csv"
         if metrics_file.exists():
             try:
@@ -655,6 +670,7 @@ class PQCDashboard(tk.Tk):
                 
         self.animate_lines()
         self.poll_federation_metrics()
+        self.poll_signature_status()  # Start polling signature updates
         
         threading.Thread(target=self._federation_thread, daemon=True).start()
         
@@ -786,8 +802,172 @@ class PQCDashboard(tk.Tk):
                 except ValueError:
                     self.flagged_label.config(text=flagged_raw)
 
+            # ── Privacy Budget Update (extract epsilon for progress bar) ────────
+            if eps_raw:
+                try:
+                    self.current_epsilon = float(eps_raw)
+                    self._update_privacy_budget_display()
+                except ValueError:
+                    pass
+
         except Exception:
             pass
+
+    def _update_privacy_budget_display(self):
+        """Update the privacy budget progress bar with color-coding."""
+        if not hasattr(self, 'eps_progress_canvas') or not self.eps_progress_canvas.winfo_exists():
+            return
+        
+        # Calculate progress as percentage (0-1, capped at 1.0)
+        progress = min(self.current_epsilon / self.epsilon_budget, 1.0)
+        
+        # Determine color based on epsilon thresholds
+        if self.current_epsilon < 0.5:
+            color = "#2ecc71"  # Green: strong privacy
+        elif self.current_epsilon < 1.0:
+            color = "#f1c40f"  # Amber: moderate privacy
+        else:
+            color = "#e74c3c"  # Red: weak privacy
+        
+        # Update canvas progress rectangle
+        self.eps_progress_canvas.delete("progress_rect")
+        canvas_width = self.eps_progress_canvas.winfo_width()
+        if canvas_width < 10:
+            canvas_width = 400
+        
+        progress_width = canvas_width * progress
+        self.eps_progress_rect = self.eps_progress_canvas.create_rectangle(
+            0, 0, progress_width, 20, fill=color, outline=color, tags="progress_rect"
+        )
+        self.eps_progress_canvas.tag_lower("progress_rect")
+        
+        # Update label
+        self.eps_usage_lbl.config(
+            text=f"Privacy budget used: ε={self.current_epsilon:.2f} / {self.epsilon_budget:.1f}",
+            fg=color
+        )
+
+    def poll_signature_status(self):
+        """Poll signature verification status from fl_round_metrics.csv every 5 seconds."""
+        if not self.is_federating:
+            return
+        
+        self._read_signature_verification()
+        if hasattr(self, 'sig_refresh_id'):
+            if self.sig_refresh_id:
+                self.after_cancel(self.sig_refresh_id)
+        self.sig_refresh_id = self.after(5000, self.poll_signature_status)
+
+    def _read_signature_verification(self):
+        """Extract signature verification status from fl_round_metrics.csv."""
+        metrics_file = config.RESULTS_PATH / "fl_round_metrics.csv"
+        if not metrics_file.exists():
+            return
+        
+        try:
+            with open(metrics_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                rows = [r for r in reader if any(v.strip() for v in r.values())]
+            
+            if not rows:
+                return
+            
+            last = rows[-1]
+            # Normalize keys
+            last = {k.strip().lower(): v.strip() for k, v in last.items()}
+            
+            # Check verification status for each node
+            for i in range(1, 4):
+                if i not in self.sig_status_widgets:
+                    continue
+                
+                # Look for node{i}_verified or node{i}_signature_verified keys
+                verified_key = next(
+                    (k for k in last if f'node{i}' in k and 'verif' in k), None
+                )
+                
+                if verified_key:
+                    value = last[verified_key].lower()
+                    is_verified = value in ('true', '1', 'yes')
+                    
+                    if is_verified:
+                        self.sig_status_widgets[i].config(
+                            text="✓ VERIFIED", 
+                            fg="#2ecc71"  # Green
+                        )
+                    else:
+                        self.sig_status_widgets[i].config(
+                            text="✗ REJECTED", 
+                            fg="#e74c3c"  # Red
+                        )
+                        # Trigger simulation flash when signature fails
+                        self._trigger_node_rejection(i)
+                else:
+                    self.sig_status_widgets[i].config(
+                        text="○ Monitoring", 
+                        fg=self.fg_sub
+                    )
+        except Exception:
+            pass
+
+    def _trigger_node_rejection(self, node_id):
+        """Flash node in red on the simulation canvas when signature fails."""
+        if not hasattr(self, 'sim_nodes') or node_id - 1 >= len(self.sim_nodes):
+            return
+        
+        # Prevent duplicate triggers
+        if self.node_rejection_state.get(node_id, False):
+            return
+        
+        self.node_rejection_state[node_id] = True
+        node_rect = self.sim_nodes[node_id - 1]
+        
+        if hasattr(self, 'sim_canvas') and self.sim_canvas.winfo_exists():
+            # Flash node red
+            self.sim_canvas.itemconfig(node_rect, fill="#e74c3c")
+            
+            # Show "SIGNATURE REJECTED" text
+            if not self.sim_rejection_text:
+                y = 50 + (node_id - 1) * 100
+                self.sim_rejection_text = self.sim_canvas.create_text(
+                    self.sim_canvas.winfo_width() * 0.5,
+                    y,
+                    text="🔴 SIGNATURE REJECTED",
+                    fill="#e74c3c",
+                    font=("Segoe UI", 12, "bold"),
+                    tags="rejection_text"
+                )
+            
+            # Restore normal state after 2 seconds
+            self.after(2000, lambda: self._restore_node_state(node_id))
+
+    def _restore_node_state(self, node_id):
+        """Restore node to normal state after rejection flash."""
+        if not hasattr(self, 'sim_nodes') or node_id - 1 >= len(self.sim_nodes):
+            return
+        
+        self.node_rejection_state[node_id] = False
+        node_rect = self.sim_nodes[node_id - 1]
+        
+        if hasattr(self, 'sim_canvas') and self.sim_canvas.winfo_exists():
+            self.sim_canvas.itemconfig(node_rect, fill="#2ecc71")
+            
+            # Remove rejection text
+            if self.sim_rejection_text:
+                self.sim_canvas.delete("rejection_text")
+                self.sim_rejection_text = None
+
+    def test_signature_rejection(self):
+        """Demo function: Simulate signature rejection on random node."""
+        import random
+        node_id = random.randint(1, 3)
+        self._trigger_node_rejection(node_id)
+        # Update the corresponding label
+        if node_id in self.sig_status_widgets:
+            self.sig_status_widgets[node_id].config(
+                text="✗ REJECTED (TEST)", 
+                fg="#e74c3c"
+            )
 
 
     # ==============================================================================
@@ -813,16 +993,24 @@ class PQCDashboard(tk.Tk):
         lbl_pqc_safe = tk.Label(pqc_card, text="QUANTUM SAFE", bg="#2ecc71", fg="white", font=("Segoe UI", 12, "bold"), padx=5, pady=2)
         lbl_pqc_safe.pack(anchor=tk.E, pady=(5,0))
 
-        # --- Added: Signature Verification Status ---
+        # ═════════════════════════════════════════════════════════════════════════
+        # FEATURE 2: Signature Verification Status with Live Updates (5-sec refresh)
+        # ═════════════════════════════════════════════════════════════════════════
         sig_frame = ttk.LabelFrame(self.content_frame, text=" Signature Verification Status (Dilithium2) ", padding=15)
         sig_frame.pack(fill=tk.X, pady=(0, 20))
         
         self.sig_status_widgets = {}
+        self.sig_refresh_id = None  # Track scheduled refresh
         for i in range(1, 4):
             row = ttk.Frame(sig_frame)
-            row.pack(fill=tk.X, pady=2)
-            ttk.Label(row, text=f"Node {i} Integrity Check:", width=25).pack(side=tk.LEFT)
-            status_icon = ttk.Label(row, text="Waiting...", font=("Segoe UI", 10, "bold"))
+            row.pack(fill=tk.X, pady=4)
+            ttk.Label(row, text=f"Node {i}:", width=12, font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 10))
+            
+            # Status container with icon + text
+            status_container = tk.Frame(row, bg=self.bg_main)
+            status_container.pack(side=tk.LEFT)
+            
+            status_icon = tk.Label(status_container, text="○ Waiting for data...", font=("Segoe UI", 10, "bold"), fg=self.fg_sub, bg=self.bg_main)
             status_icon.pack(side=tk.LEFT)
             self.sig_status_widgets[i] = status_icon
 
@@ -1042,6 +1230,9 @@ class PQCDashboard(tk.Tk):
     # 6. SIMULATION VIEW
     # ==============================================================================
     def build_simulation_view(self):
+        # ═════════════════════════════════════════════════════════════════════════
+        # FEATURE 3: Simulation Panel with Signature Rejection Flash Animation
+        # ═════════════════════════════════════════════════════════════════════════
         control_frame = ttk.Frame(self.content_frame)
         control_frame.pack(fill=tk.X, pady=(0, 15))
         
@@ -1059,6 +1250,14 @@ class PQCDashboard(tk.Tk):
         )
         self.toggle_fed_btn.pack(side=tk.LEFT, padx=10)
         
+        # Test Signature Rejection button (for demo purposes)
+        self.test_sig_reject_btn = ttk.Button(
+            control_frame,
+            text="🔴 Test Signature Rejection",
+            command=self.test_signature_rejection
+        )
+        self.test_sig_reject_btn.pack(side=tk.LEFT, padx=10)
+        
         viz_frame = ttk.LabelFrame(self.content_frame, text=" IoT Network Architecture & Attack Simulation ", padding=10)
         viz_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -1073,8 +1272,13 @@ class PQCDashboard(tk.Tk):
         self.sim_server_arrows = []
         self.sim_server = None
         self.sim_federating = False
+        self.sim_rejection_text = None  # For flashing "SIGNATURE REJECTED" text
+        
+        # Track node rejection states for visual feedback
+        self.node_rejection_state = {1: False, 2: False, 3: False}
         
         self.animate_sim_arrows()
+        self.poll_signature_failures()  # Start monitoring for signature failures
 
     def _draw_sim_canvas(self, event=None):
         if not hasattr(self, 'sim_canvas') or not self.sim_canvas.winfo_exists():

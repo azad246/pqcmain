@@ -1,0 +1,11 @@
+round,global_accuracy,global_f1_score,global_loss,epsilon,node1_verified,node2_verified,node3_verified,flagged_clients
+1,0.8500,0.8450,0.4200,0.1500,True,True,True,0
+2,0.8620,0.8580,0.3900,0.3200,True,True,False,1
+3,0.8750,0.8710,0.3600,0.5100,True,False,True,1
+4,0.8820,0.8790,0.3350,0.7200,True,True,True,0
+5,0.8900,0.8870,0.3150,0.9500,False,True,True,1
+6,0.8950,0.8920,0.2950,1.0500,True,True,False,2
+7,0.9020,0.8990,0.2800,1.1200,True,False,True,1
+8,0.9080,0.9050,0.2650,1.2100,False,False,True,3
+9,0.9120,0.9090,0.2550,1.3000,True,True,True,0
+10,0.9180,0.9150,0.2450,1.4200,True,True,False,1
